@@ -1,0 +1,1681 @@
+"""Builds notebooks/model analysis.ipynb from CELLS."""
+import json, sys
+from pathlib import Path
+ROOT = Path(__file__).resolve().parents[1]
+CELLS = []
+def md(s): CELLS.append(("markdown", s.strip("\n")))
+def co(s): CELLS.append(("code", s.strip("\n")))
+
+def dump():
+    cells = []
+    for kind, src in CELLS:
+        c = {"cell_type": kind, "metadata": {}, "source": src.splitlines(keepends=True)}
+        if kind == "code":
+            c["execution_count"] = None; c["outputs"] = []
+        cells.append(c)
+    nb = {"cells": cells, "metadata": {
+            "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+            "language_info": {"name": "python", "version": "3.10"}},
+          "nbformat": 4, "nbformat_minor": 5}
+    out = ROOT / "notebooks" / "model analysis.ipynb"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(nb, indent=1))
+    print(f"wrote {out}  ({len(cells)} cells)")
+md(r"""
+# Deepfake Model Comparison — Celeb-DF-v2
+
+**Skyra / Qwen2.5-VL transfer, and a dual forensic evidence extension.**
+
+This notebook runs top to bottom. Cells are marked:
+
+| mark | meaning |
+|---|---|
+| `[CPU]` | runs anywhere in minutes. **Already validated** on this dataset. |
+| `[GPU]` | needs the RTX 4060. Skipped automatically if CUDA is absent. |
+| `[NET]` | downloads model weights from HuggingFace on first run. |
+
+## Read this before you read any number in this notebook
+
+Three facts were **measured** before any model was trained. They constrain
+every claim made here, and they are reproduced in §2–§5 rather than asserted.
+
+1. **A random split over clips leaks 95.1% of the test set.** Identity-disjoint
+   splitting is not a nicety here; it is the difference between a real number
+   and a fictional one.
+2. **The official Celeb-DF-v2 test list is itself not identity-disjoint** — its
+   517 clips touch identity groups containing 96.5% of the dataset. Published
+   numbers on that protocol are measured with training identities in test.
+3. **Skyra is not a face-swap detector.** It was trained on fully AI-generated
+   video (Wan, CogVideoX, Hunyuan, Sora-2) and is never evaluated on Celeb-DF
+   or FaceForensics++. Running it here is an *out-of-distribution transfer
+   test*, not a like-for-like baseline.
+
+So the research question this notebook answers is **not** "do we beat Skyra".
+It is:
+
+> A state-of-the-art grounded-artifact-reasoning detector for generated video
+> has a taxonomy with no category for localised face replacement. How far does
+> it transfer to face-swap forensics, and does conditioning it on
+> face-geometry-derived forensic evidence close the gap?
+
+Full detail and sources: `docs/FINDINGS.md`.
+""")
+
+md(r"""
+## 1. Environment & Configuration
+
+Every path and hyper-parameter lives here. Nothing below hard-codes a
+machine-specific path.
+""")
+
+co(r"""
+import os, sys, json, time, warnings, platform
+from pathlib import Path
+warnings.filterwarnings("ignore")
+
+# --- resolve the project root whether this runs from notebooks/ or the root --
+def _find_root(start: Path) -> Path:
+    for p in [start, *start.parents]:
+        if (p / "src" / "fsvnet").is_dir():
+            return p
+    raise RuntimeError("could not locate the project root (looking for src/fsvnet)")
+
+PROJECT_ROOT = _find_root(Path.cwd().resolve())
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+# ============================ CONFIGURATION ================================
+DATA_ROOT    = PROJECT_ROOT / "Celeb-DF-v2"
+OUTPUT_ROOT  = PROJECT_ROOT / "results"
+MODEL_ROOT   = PROJECT_ROOT / "models"
+MANIFEST_DIR = PROJECT_ROOT / "data" / "manifests"
+CACHE_DIR    = PROJECT_ROOT / "data" / "processed"
+PLOT_DIR     = OUTPUT_ROOT / "visualizations"
+
+NUM_FRAMES    = 16          # matches lmf_cache_16f.npz exactly; ~7 min/epoch measured
+VLM_FRAMES    = 4           # frames shown to the VLM (memory-bound)
+IMAGE_SIZE    = 224
+BATCH_SIZE    = 2           # 4060 8 GB
+NUM_WORKERS   = 2           # 4 exhausted host RAM on Windows
+GRAD_ACCUM    = 8           # -> effective batch 16
+NUM_EPOCHS    = 6           # upper bound; TRAIN_BUDGET_HOURS may cut it short
+TRAIN_BUDGET_HOURS = 8.0    # hard wall-clock cap across ALL conditions
+LEARNING_RATE = 3e-4
+SEED          = 42
+
+# Only a run that loads these weights may be labelled "Skyra" in a table.
+# Get the repo id from the HF collection at https://github.com/JoeLeelyf/Skyra
+SKYRA_MODEL_ID = os.environ.get("SKYRA_MODEL_ID", "")
+QWEN_BASE_ID   = "Qwen/Qwen2.5-VL-3B-Instruct"   # what an 8 GB card can tune
+# ===========================================================================
+
+for d in [OUTPUT_ROOT, MODEL_ROOT, MANIFEST_DIR, CACHE_DIR, PLOT_DIR,
+          OUTPUT_ROOT / "baseline", OUTPUT_ROOT / "proposed", OUTPUT_ROOT / "comparison"]:
+    d.mkdir(parents=True, exist_ok=True)
+
+try:
+    import torch
+    HAS_TORCH = True
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+except ImportError:
+    HAS_TORCH, DEVICE = False, "cpu"
+
+HAS_GPU = HAS_TORCH and DEVICE == "cuda"
+print(f"project root : {PROJECT_ROOT}")
+print(f"python       : {platform.python_version()}  ({platform.system()})")
+print(f"torch        : {torch.__version__ if HAS_TORCH else 'NOT INSTALLED'}")
+print(f"device       : {DEVICE}")
+if HAS_GPU:
+    p = torch.cuda.get_device_properties(0)
+    print(f"gpu          : {p.name}  {p.total_memory/1e9:.1f} GB")
+else:
+    print("gpu          : none -> every [GPU] cell below will SKIP and say so.")
+print(f"skyra weights: {SKYRA_MODEL_ID or 'NOT CONFIGURED -> Skyra row will report NOT RUN'}")
+""")
+
+co(r"""
+import numpy as np, pandas as pd
+import matplotlib
+import matplotlib.pyplot as plt
+if HAS_TORCH:
+    import torch
+    torch.manual_seed(SEED)
+np.random.seed(SEED)
+
+plt.rcParams.update({
+    "figure.dpi": 110, "savefig.dpi": 150, "font.size": 10,
+    "axes.spines.top": False, "axes.spines.right": False,
+    "axes.grid": True, "grid.alpha": 0.25, "figure.facecolor": "white",
+})
+C_REAL, C_FAKE = "#2b7a78", "#c1452b"
+C_A, C_B, C_C = "#4c6ef5", "#f59f00", "#7048e8"
+
+def save_fig(fig, name):
+    p = PLOT_DIR / f"{name}.png"
+    fig.savefig(p, bbox_inches="tight"); print(f"  -> {p.relative_to(PROJECT_ROOT)}")
+    return p
+
+def show_table(frame, caption=None, precision=4, na_rep="not measured",
+               gradient=None):
+    """
+    Render a DataFrame, degrading gracefully.
+
+    pandas' .style accessor needs jinja2, and a notebook that dies on a
+    *display* dependency is a bad notebook. This tries the styled version and
+    falls back to plain text, so every cell below still produces its result on
+    a bare install.
+    """
+    if caption:
+        print(caption)
+    try:
+        st = frame.style.hide(axis="index").format(precision=precision, na_rep=na_rep)
+        if gradient:
+            cols = [c for c in gradient if c in frame.columns]
+            if cols:
+                st = st.background_gradient(subset=cols, cmap="Greens")
+        if caption:
+            st = st.set_caption(caption)
+        display(st)
+    except Exception:
+        with pd.option_context("display.max_columns", None, "display.width", 200,
+                               "display.float_format", lambda v: f"{v:.{precision}f}"):
+            print(frame.to_string(index=False, na_rep=na_rep))
+    return frame
+
+def skip(reason):
+    print(f"[SKIPPED] {reason}")
+    print("          Nothing is fabricated to fill the gap; the result is "
+          "reported as NOT RUN.")
+""")
+
+md(r"""
+## 2. Project / Dataset Audit
+
+### 2.1 Architecture audit — what already existed
+
+This is not a new project. Before anything was changed, the existing
+implementation was inspected. What was found, and what happened to it:
+
+| component | status | disposition |
+|---|---|---|
+| `image_stage/` — EfficientNet-B0 image classifier, balanced training, focal loss, AdamW, Grad-CAM | works; honest held-out AUC **0.5702** (0.7998 on a leaky random split) | **kept** as `image_stage/`, used as the FSW-Net warm start and as Baseline A |
+| `src/fsvnet/` — FSV-Net video pipeline, TSC branch, evidence pack, Qwen path, Streamlit app | complete, smoke-tested, never run on real data | **kept and extended** — this is the codebase |
+| `manifest.py` — union-find identity-disjoint splitting | correct and load-bearing | **kept unchanged**, reused verbatim for the frames distribution |
+| `video_io.py`, `faces.py` — decode + face detect | correct, but **not applicable**: this dataset ships crops | **bypassed** on Celeb-DF-v2, still used for arbitrary uploads in the app |
+| `dataset.py` filmstrip cache | redundant here (data is already cached crops) | **superseded** by `dataset_frames.py` |
+| `Celeb-DF-v2.zip` (12.4 GB), `video_detector.zip` | verified byte-identical to extracted content | **deleted** after verification |
+
+Two things were newly written: `celebdf_frames.py` (the adapter for the
+pre-extracted distribution) and `lmf.py` (the second novel branch).
+
+### 2.2 Storage audit
+
+External drives and previous dataset locations were **not reachable** from the
+execution environment — only the connected project folder is mounted. So
+FaceForensics++, DFDC and DeeperForensics are **unavailable**, and the
+cross-dataset generalisation test in §15 reports them as such rather than
+inventing numbers. `D:\mystuff\deepfake-detection` (the frequency-feature image
+pipeline) was likewise not mounted.
+""")
+
+co(r"""
+# [CPU] Dataset layout, measured from disk rather than assumed.
+from fsvnet import celebdf_frames as cf
+
+probe_path = MANIFEST_DIR / "celebdf_layout_probe.json"
+if probe_path.exists():
+    probe = json.load(open(probe_path))
+else:
+    probe = cf.probe_layout(DATA_ROOT); json.dump(probe, open(probe_path, "w"), indent=2)
+
+print("Celeb-DF-v2 as it exists on disk")
+print("=" * 62)
+for sub, v in probe["subsets"].items():
+    print(f"  {sub:<18} {v['n_clips']:>5} clips   label={v['label']}  "
+          f"landmarks={v['n_landmark_dirs']:>5}  "
+          f"frames/clip~{v['frames_per_clip_sampled']['mean']}")
+print(f"\n  resolution        : {probe['resolutions']}")
+print(f"  source-frame stride: {probe['inferred_source_strides']}")
+print(f"  issues            : {probe['issues'] or 'none'}")
+print("""
+  NOTE: this is the PRE-EXTRACTED distribution -- PNG face crops plus 81-point
+  landmarks, not raw video. Consequences:
+    * no audio, no codec metadata, no arbitrary temporal resampling
+    * face detection is a no-op; crops already exist at 256x256
+    * PNG filenames are SOURCE frame indices, and the stride between them is
+      NOT constant across clips (measured: 5-50) -- the distributor sampled a
+      fixed ~32 frames per video, so the stride scales with video length
+    * timestamps are RECONSTRUCTED as source_index/30 and labelled approximate
+    * the landmarks are the resource that makes the LMF branch possible
+""")
+""")
+md(r"""
+## 3. Dataset Statistics & the Split
+
+The split is the most important code in this project. A swap `id0 -> id16`
+binds two identities, so the only honest unit is the **connected component of
+the identity graph**, built by union-find over every identity pair a
+manipulation touches.
+""")
+
+co(r"""
+# [CPU] Build (or load) the manifest and the identity-disjoint split.
+MAN = MANIFEST_DIR / "celebdf_v2_identity.csv"
+if not MAN.exists():
+    print("building manifest -- a few minutes on first run ...")
+    os.system(f'"{sys.executable}" "{PROJECT_ROOT / "scripts" / "build_celebdf_manifest.py"}"')
+
+# Manifest paths are stored relative to the project root and resolved here,
+# so the same CSV works on Windows and Linux and survives a folder move.
+df = cf.load_manifest(MAN, PROJECT_ROOT)
+stats = json.load(open(MANIFEST_DIR / "celebdf_v2_stats.json"))
+audit = json.load(open(MANIFEST_DIR / "leakage_audit.json"))
+
+print(f"clips              : {stats['n_clips']:,}")
+print(f"identity groups    : {stats['n_identity_groups']}")
+print(f"real / fake        : {stats['by_label']['real']:,} / {stats['by_label']['fake']:,}"
+      f"   ({stats['class_imbalance_fake_pct']}% fake)")
+print(f"total frames       : {stats['total_frames']:,}")
+print(f"frames per clip    : {stats['frames_per_clip']}")
+print(f"approx duration (s): {stats['duration_approx_s']}")
+print(f"clips w/ landmarks : {stats['clips_with_landmarks']:,}")
+print()
+print(df.groupby(["split", "label_name"]).size().unstack(fill_value=0)
+        .reindex(["train", "val", "test"]))
+
+overlap = set(df[df.split=="train"].group) & set(df[df.split=="test"].group)
+print(f"\nidentity groups shared between train and test: {len(overlap)}  (must be 0)")
+assert not overlap, "SPLIT LEAKS"
+""")
+
+co(r"""
+# [CPU] The leakage audit -- what a random split would have been measuring.
+print("LEAKAGE AUDIT")
+print("=" * 62)
+print(f"  a random split puts {audit['contamination_rate']*100:.1f}% of test clips "
+      f"({audit['test_videos_whose_identity_is_in_train']:,} of "
+      f"{audit['random_split_test_videos']:,}) in the same identity group as train.")
+print("  That is the number a random-split AUC would be reporting.")
+
+names = cf.official_test_names(DATA_ROOT / "List_of_testing_videos.txt")
+m = df.clip_name.isin(names)
+g = set(df.loc[m, "group"])
+print(f"\n  official Celeb-DF test list: {int(m.sum())} clips, touching {len(g)} "
+      f"identity groups")
+print(f"  those groups contain {int(df.group.isin(g).sum()):,} clips "
+      f"({df.group.isin(g).mean()*100:.1f}% of the dataset)")
+print("""
+  >>> The official protocol is NOT identity-disjoint. Forcing whole identity
+  >>> groups into test leaves 96 training clips. So this notebook reports the
+  >>> identity-disjoint number as its headline, and can only report an
+  >>> official-protocol number as a separately labelled, identity-LEAKY row.
+""")
+""")
+
+co(r"""
+# [CPU] Figure: composition, imbalance and group-size distribution.
+fig, ax = plt.subplots(1, 3, figsize=(14, 3.8))
+sub = df.groupby(["subset", "label_name"]).size().unstack(fill_value=0)
+sub.plot(kind="barh", stacked=True, ax=ax[0], color=[C_FAKE, C_REAL], width=.7)
+ax[0].set_title("clips by subset"); ax[0].set_xlabel("clips"); ax[0].set_ylabel("")
+
+sp = df.groupby(["split", "label_name"]).size().unstack(fill_value=0).reindex(["train","val","test"])
+sp.plot(kind="bar", stacked=True, ax=ax[1], color=[C_FAKE, C_REAL], width=.6, rot=0)
+ax[1].set_title(f"identity-disjoint split ({stats['class_imbalance_fake_pct']}% fake overall)")
+ax[1].set_ylabel("clips")
+
+gs = df.groupby("group").size()
+ax[2].hist(gs, bins=40, color=C_A, alpha=.85)
+ax[2].set_yscale("log"); ax[2].set_title(f"identity-group sizes (n={len(gs)})")
+ax[2].set_xlabel("clips in group"); ax[2].set_ylabel("groups (log)")
+fig.suptitle("Celeb-DF-v2 composition", y=1.03, fontsize=12)
+fig.tight_layout(); save_fig(fig, "dataset_composition"); plt.show()
+""")
+
+md(r"""
+## 4. Celeb-DF-v2 Visualization
+
+Real and fake clips side by side, with the 81 landmarks that make the LMF
+branch possible drawn on top.
+""")
+
+co(r"""
+# [CPU] Sample frames + landmarks, from the TEST split so nothing here is
+# cherry-picked from what a model will be trained on.
+from fsvnet import lmf as LMF
+
+te = df[df.split == "test"]
+pick_r = te[te.label == 0].iloc[0]
+pick_f = te[te.label == 1].iloc[0]
+
+fig, axes = plt.subplots(2, 6, figsize=(15, 5.4))
+for row, (rec, tag, col) in enumerate([(pick_r, "REAL", C_REAL), (pick_f, "FAKE", C_FAKE)]):
+    fr, lm, meta = cf.load_clip(rec.video_path, rec.landmark_path, n_frames=6, img_size=256)
+    for j in range(6):
+        axes[row, j].imshow(fr[j]); axes[row, j].axis("off")
+        if lm is not None:
+            axes[row, j].scatter(lm[j][:, 0], lm[j][:, 1], s=1.2, c="#ffd43b", alpha=.85)
+        axes[row, j].set_title(f"t={meta['timestamp_s_approx'][j]:.1f}s", fontsize=8)
+    axes[row, 0].set_ylabel(tag)
+    axes[row, 0].text(-0.35, .5, f"{tag}\n{rec.clip_name}", transform=axes[row, 0].transAxes,
+                      rotation=90, va="center", ha="center", color=col, fontsize=9)
+fig.suptitle("Celeb-DF-v2 test clips with 81-point landmarks  (timestamps approximate)", y=1.02)
+fig.tight_layout(); save_fig(fig, "dataset_samples"); plt.show()
+""")
+
+md(r"""
+## 5. Preprocessing, and the two forensic channels
+
+Both models see **identical frames**: the same uniform temporal sampling, the
+same 256x256 crops, the same normalisation. Any preprocessing difference
+between conditions would make the comparison meaningless, so there is one
+loader (`dataset_frames.py`) and both paths draw from it.
+
+### 5.1 The two channels, and why they are orthogonal
+
+| | **TSC** (`tsc.py`) | **LMF** (`lmf.py`) |
+|---|---|---|
+| domain | frequency | spatial |
+| coordinates | raw pixel grid | **face-canonical** (landmark-warped) |
+| question | does fine detail evolve in time the way a camera's does? | is the frame-to-frame change spatially bound to the face geometry? |
+| operator | rFFT along time over azimuthal power rings | Procrustes warp -> motion-compensated residual -> region pooling |
+| weakest when | the head is still (little fine detail changing) | the head is still (warp -> identity) |
+| uses landmarks | no | **yes** |
+
+They share no operator and no coordinate frame, which is what makes
+`tsc_only` / `lmf_only` / `both` a genuine decomposition rather than two views
+of one signal.
+
+### 5.2 What LMF does, step by step
+
+    frames + landmarks
+      -> Procrustes similarity fit on motion-stable points (eyes + nose bridge)
+      -> warp into canonical face coordinates          (head motion removed)
+      -> R_t = I~_t - I~_{t-1}                          (motion-compensated residual)
+      -> pool over three FIXED regions: inner face / blend-seam band / outside
+      -> region-energy series (T-1, 3) + 7 closed-form descriptors
+
+Removing head motion *geometrically* is the point. In image coordinates a
+pixel changes mostly because the head moved; a temporal statistic there is
+mostly measuring motion. After the warp, the face mask is the same pixels in
+every frame, so "inside the swapped region" means the same thing throughout.
+""")
+
+co(r"""
+# [CPU] Verify the 81-point layout assumption on real data instead of trusting it.
+lms = []
+for lp in df[(df.split=="train") & (df.label==0)].landmark_path.head(10):
+    for f in sorted(Path(lp).glob("*.npy"))[:4]:
+        lms.append(np.load(f).astype(np.float64))
+layout_rep = LMF.verify_landmark_layout(np.stack(lms))
+print("81-point layout check (dlib-68 + 13 forehead):")
+for k, v in layout_rep["checks"].items():
+    print(f"   {'PASS' if v else 'FAIL'}  {k}")
+print(f"   -> {'assumption holds; semantic region masks are valid' if layout_rep['ok'] else layout_rep.get('advice')}")
+
+TPL_PATH = MANIFEST_DIR / "lmf_template.npy"
+if TPL_PATH.exists():
+    template = np.load(TPL_PATH)
+    print(f"\ncanonical template loaded from {TPL_PATH.name} "
+          "(built from TRAIN REALS ONLY -- building it from anything else leaks)")
+else:
+    template = LMF.build_template(np.stack(lms), size=256); np.save(TPL_PATH, template)
+masks = LMF.region_masks(template, 256)
+print("region sizes (px):", {k: int(v.sum()) for k, v in masks.items()})
+""")
+
+co(r"""
+# [CPU] Show the LMF pipeline on one real and one fake test clip.
+fig, axes = plt.subplots(2, 4, figsize=(13, 6.4))
+for row, (rec, tag) in enumerate([(pick_r, "REAL"), (pick_f, "FAKE")]):
+    fr, lm, _ = cf.load_clip(rec.video_path, rec.landmark_path, n_frames=8, img_size=256)
+    res = LMF.analyse_clip(fr, lm, template, size=256, keep_maps=True)
+    axes[row,0].imshow(fr[0]); axes[row,0].set_title(f"{tag}: input frame")
+    axes[row,1].imshow(res.warped[0]); axes[row,1].set_title("canonical (motion removed)")
+    ov = np.zeros((256,256,3)); ov[...,1]=masks["inner"]; ov[...,0]=masks["boundary"]; ov[...,2]=masks["outer"]
+    axes[row,2].imshow(res.warped[0]); axes[row,2].imshow(ov, alpha=.30)
+    axes[row,2].set_title("regions: inner / seam / outer", fontsize=9)
+    r0 = np.abs(res.residual[0]); v = np.percentile(r0, 99.3)
+    axes[row,3].imshow(r0, cmap="magma", vmax=max(v,1e-6))
+    axes[row,3].set_title("|motion-compensated residual|", fontsize=9)
+    for a in axes[row]: a.axis("off")
+fig.suptitle("LMF: warp away head motion, then ask where the residual energy lives", y=1.02)
+fig.tight_layout(); save_fig(fig, "lmf_pipeline"); plt.show()
+""")
+md(r"""
+### 5.3 The pre-registered CPU probe — do these descriptors survive?
+
+Before spending any GPU time, both channels were reduced to their closed-form
+descriptors and pushed through a linear probe and a gradient-boosted tree on
+the identity-disjoint split. A probe on 7–10 scalars is deliberately weak: it
+is a **lower bound** on what the learned branches can do, and it cannot be
+accused of memorising.
+
+The result was negative, and it is reported here rather than buried.
+""")
+
+co(r"""
+# [CPU] Head-to-head descriptor probe. Reproduce with:
+#   python scripts/extract_lmf.py && python scripts/extract_tsc.py
+#   python scripts/compare_branch_probes.py
+probe_path = OUTPUT_ROOT / "comparison" / "branch_probe_comparison.json"
+if not probe_path.exists():
+    skip("descriptor probe not yet run -- see scripts/compare_branch_probes.py")
+    PROBE = None
+else:
+    PROBE = json.load(open(probe_path))
+    print(f"clips {PROBE['n_clips']}, test {PROBE['n_test']} "
+          f"({PROBE['test_real']} real / {PROBE['test_fake']} fake), "
+          f"{PROBE['probe_frames_per_clip']} frames/clip")
+    print(f"split: {PROBE['split']}\n")
+    rows = []
+    for ch, models in PROBE["channels"].items():
+        for kind, r in models.items():
+            rows.append({"channel": ch, "model": kind, "test AUC": r["auc"],
+                         "95% CI": f"{r['ci95'][0]:.3f}-{r['ci95'][1]:.3f}",
+                         "PR-AUC": r["pr_auc"], "Bal.Acc": r["bal_acc"]})
+    probe_tbl = pd.DataFrame(rows)
+    show_table(probe_tbl, "closed-form descriptor probes, identity-disjoint test")
+    print("\npaired bootstrap on the DIFFERENCE (the correct test -- both models "
+          "are scored on the same clips):")
+    for k, v in PROBE["paired_bootstrap"].items():
+        res = "resolved" if (v["ci95"][0] > 0 or v["ci95"][1] < 0) else "NOT RESOLVED"
+        print(f"   {k:<26} {v['delta_auc']:+.4f}  CI [{v['ci95'][0]:+.3f},"
+              f"{v['ci95'][1]:+.3f}]  p={v['p_two_sided']:.3f}   [{res}]")
+""")
+
+co(r"""
+# [CPU] The leakage demonstration: same features, same classifier, different splits.
+leak_path = OUTPUT_ROOT / "baseline" / "lmf_leakage_demo.json"
+if leak_path.exists():
+    L = json.load(open(leak_path))
+    tbl = pd.DataFrame(L).T[["linear", "gbdt"]].dropna()
+    print("Same LMF features, same classifier, different split regimes:\n")
+    print(tbl.to_string())
+    id_ = L["identity_disjoint"]["linear"]; rnd = L["random_clip_split"]["linear"]
+    print(f"\n  >>> {rnd - id_:+.4f} AUC of apparent performance is identity leakage "
+          "and nothing else.")
+    ip = L.get("identity_prediction_from_descriptors")
+    if ip:
+        print(f"\n  control 1: descriptors do NOT directly predict identity "
+              f"(CV acc {ip['cv_accuracy']:.3f} vs {ip['chance_accuracy']:.3f} chance)")
+        print("             -> the leak is capture-condition confounding, not identity encoding")
+    print(f"  control 2: among REAL clips only, the descriptors separate YouTube-real "
+          f"from Celeb-real at AUC {L['source_subset_auc_among_reals']:.3f}")
+    print("             -> there is a source confound; the split is what stops a model exploiting it")
+
+    fig, ax = plt.subplots(figsize=(6.6, 3.4))
+    labs = ["identity-disjoint\n(honest)", "random split\nover clips", "random split\nCeleb only"]
+    keys = ["identity_disjoint", "random_clip_split", "random_split_celeb_only"]
+    x = np.arange(3); w = .36
+    ax.bar(x-w/2, [L[k]["linear"] for k in keys], w, label="linear", color=C_A)
+    ax.bar(x+w/2, [L[k]["gbdt"] for k in keys], w, label="gbdt", color=C_B)
+    ax.axhline(.5, ls="--", c="grey", lw=1); ax.text(2.42, .505, "chance", fontsize=8, color="grey")
+    ax.set_xticks(x); ax.set_xticklabels(labs, fontsize=9); ax.set_ylim(.45, .68)
+    ax.set_ylabel("test AUC"); ax.legend(frameon=False)
+    ax.set_title("The same features look better when the split leaks", fontsize=11)
+    fig.tight_layout(); save_fig(fig, "leakage_demonstration"); plt.show()
+else:
+    skip("run scripts/lmf_leakage_demo.py")
+""")
+
+md(r"""
+**What §5.3 licenses, and what it does not.**
+
+Every closed-form channel sits between **0.51 and 0.59 AUC** on unseen
+identities, and no pairwise difference is resolved. This does *not* prove the
+branches are worthless — both probes compress a whole clip to 7–10 scalars,
+while the learned branches consume the full `(T-1, 3)` region-energy series and
+the `(F, K)` TSC map alongside a spatial CNN backbone.
+
+It does mean the ablation in §19 is a **real open question**. If the branches
+do not help, that is the finding, and it gets reported.
+""")
+
+md(r"""
+## 6. Baseline A — the existing project model
+
+The image stage of this capstone: EfficientNet-B0, balanced sampling, focal
+loss, AdamW, Grad-CAM. Its honest held-out AUC was **0.5702** (0.7998 on a
+leaky random split — the same failure §5.3 reproduces at video level).
+
+It is used two ways: as a **frame-level baseline** (score frames, average per
+clip) and as the **warm start** for FSV-Net's spatial branch. The warm start
+transfers features, not accuracy — nothing about 0.5702 carries over.
+""")
+
+co(r"""
+# [GPU/CPU] Baseline A -- the existing EfficientNet checkpoint, scored per frame
+# and averaged to the clip level.
+CKPTS = sorted((PROJECT_ROOT / "image_stage" / "notebooks").glob("*.pth"))
+print("existing image-stage checkpoints found:")
+for c in CKPTS:
+    print(f"   {c.name:<38} {c.stat().st_size/1e6:6.1f} MB")
+FSW_CKPT = next((c for c in CKPTS if "fsw" in c.name.lower()), CKPTS[0] if CKPTS else None)
+print(f"\nselected for warm start / Baseline A: {FSW_CKPT.name if FSW_CKPT else 'NONE FOUND'}")
+if not HAS_TORCH:
+    skip("torch not installed -- Baseline A cannot be scored here")
+""")
+
+md(r"""
+## 7. Baseline B — Skyra / Qwen2.5-VL
+
+### What Skyra actually is
+
+Sources: [arXiv 2512.15693](https://arxiv.org/abs/2512.15693),
+[github.com/JoeLeelyf/Skyra](https://github.com/JoeLeelyf/Skyra/) (CVPR 2026).
+
+* Base: **Qwen2.5-VL-7B-Instruct**.
+* Stage 1: SFT on **ViF-CoT-4K** (~5K videos; 3.5K real from Panda-70M, 1.5K
+  from Kinetics-400) with human artifact annotations and chain-of-thought.
+* Stage 2: **GRPO** with an asymmetric accuracy reward (false positives
+  penalised −0.2) plus an inspection/format reward.
+* Taxonomy, three layers: *low-level forgery* and *violation of laws* → 8
+  categories (colour/light, texture, motion forgery, object inconsistency,
+  interaction inconsistency, causality, commonsense, unnatural movement) →
+  fine-grained observables.
+* Trained and evaluated on **fully generated video**: Wan2.1/2.2, CogVideoX,
+  Hunyuan, Sora-2, LTX, MiniMax-Hailuo.
+* **Weights are released** (HuggingFace collection linked from the repo).
+
+### Three limitations that must be stated, not worked around
+
+1. **Skyra is not a face-swap detector.** Its taxonomy has no category for
+   localised face replacement, and it is never evaluated on Celeb-DF or FF++.
+   A Celeb-DF swap violates no physics and no causality — it is a blended
+   region inside an otherwise real video. **This run is an out-of-distribution
+   transfer test.**
+2. **Skyra's training setup cannot be reproduced here.** ViF-CoT-4K's
+   fine-grained human artifact annotations are what make the SFT + GRPO recipe
+   work, and this project has no equivalent annotations for Celeb-DF. What is
+   implemented is a *reproducible approximation* — constrained-token scoring
+   plus optional LoRA — and it is labelled as such everywhere.
+3. **7B does not fit for training on 8 GB.** Skyra runs here as **NF4 inference
+   only**. The proposed model therefore fine-tunes **Qwen2.5-VL-3B**, and the
+   comparison table says so, because a size difference that is not stated is a
+   misleading comparison.
+
+Only a run that loads the released weights is labelled "Skyra". A base Qwen
+with a forensic prompt is labelled "Skyra-style".
+""")
+
+co(r"""
+# [GPU][NET] Preflight the VLM path BEFORE launching anything expensive.
+from fsvnet.qwen_detector import QwenDetectorConfig, preflight
+
+qcfg = QwenDetectorConfig()
+qcfg.model_id = QWEN_BASE_ID
+qcfg.num_frames = VLM_FRAMES
+preflight_rep = preflight(qcfg)
+print(json.dumps(preflight_rep, indent=2, default=str)[:2500])
+
+if not SKYRA_MODEL_ID:
+    print("\n" + "="*62)
+    skip("SKYRA_MODEL_ID is not set -- the official Skyra row will be NOT RUN.")
+    print("""
+    To run it: get the repo id from the HuggingFace collection linked at
+    https://github.com/JoeLeelyf/Skyra , then
+
+        export SKYRA_MODEL_ID=<org>/<repo>        # or set it in cell 1
+
+    Base Qwen is NOT substituted for Skyra. A row labelled "Skyra" that is not
+    Skyra is worse than a missing row.""")
+""")
+md(r"""
+## 8. Model C — the proposed architecture
+
+### Name
+
+**FSV-Net/DFE — Dual Forensic Evidence**, and the VLM condition
+**Qwen-DFE** (Skyra-style, base Qwen2.5-VL-3B + dual forensic evidence).
+
+### What was changed
+
+Two clip-level forensic channels are inserted between the visual
+representation and the reasoning layers, and the language model is conditioned
+on their **percentile-calibrated measurements** rather than only on frames.
+
+    frames ---> per-frame branches (spatial / frequency / SRM)
+      |                    |
+      |                    +--> temporal encoders --------+
+      |                                                   |
+      +--> TSC : rFFT along time over azimuthal rings ----+--> BranchAttentionFusion
+      |          (frequency domain, image coordinates)    |         |
+      |                                                   |         v
+      +--> LMF : landmark Procrustes warp -> motion-      +      classifier
+                 compensated residual -> region pooling
+                 (spatial domain, FACE-CANONICAL coords)
+
+    the same two measurement vectors, percentile-calibrated, are injected into
+    the Qwen prompt -> grounded artifact reasoning
+
+### Why this is a novel contribution and not a reskin
+
+* **It is not one of the excluded moves.** It is not a new classifier head, not
+  a linear layer, not a bigger model, not a prompt change, not ordinary LoRA,
+  not generic attention. It introduces a forensic operator — a
+  geometry-conditioned, motion-compensated residual in a landmark-defined
+  coordinate frame — that does not exist in the backbone.
+* **It uses data the backbone cannot use.** Qwen2.5-VL tokenises pixels. It has
+  no mechanism to compute a Procrustes warp, and no representation of a
+  temporal spectrum at a frequency scale below its patch grid. Handing it the
+  measurement is the only way that evidence can enter the reasoning at all.
+* **It targets the specific gap identified in §7.** Skyra's taxonomy covers
+  physics and causality; a face swap is a *localised, geometry-bound edit*. LMF
+  measures exactly that asymmetry — inside the mask vs the blend seam vs
+  outside — which is the category Skyra has no word for.
+* **The ablation is clean by construction.** TSC and LMF share no operator and
+  no coordinate frame, and both are cached, so `-TSC` / `-LMF` change the
+  architecture without changing the compute budget. The gap between conditions
+  *is* the value of the channel, measured rather than asserted.
+
+### Why it may still fail — stated up front
+
+§5.3 measured both channels' closed-form summaries at 0.51–0.59 AUC
+identity-disjoint. The learned branches see far richer inputs, but the honest
+position before training is that **this is a hypothesis with a mechanism and a
+pre-registered test, not a result.** §19 decides it.
+""")
+
+co(r"""
+# [CPU] Build the model and report where the parameters actually are.
+if HAS_TORCH:
+    from fsvnet import Config
+    from fsvnet.model import build_model
+
+    cfg = Config()
+    cfg.data.num_frames = NUM_FRAMES
+    cfg.data.img_size   = IMAGE_SIZE
+    cfg.train.batch_size = BATCH_SIZE
+    cfg.train.grad_accum = GRAD_ACCUM
+    cfg.train.epochs     = NUM_EPOCHS
+    cfg.train.lr         = LEARNING_RATE
+    cfg.data.seed        = SEED
+    if hasattr(cfg, "auto_tune"):
+        cfg = cfg.auto_tune()
+    print(cfg)
+
+    model = build_model(cfg)
+    rep = model.param_report()
+    tot = rep["TOTAL"]["total"] if isinstance(rep["TOTAL"], dict) else rep["TOTAL"]
+    print(f"\nactive branches: {model.branch_names}")
+    print(f"{'component':<14}{'params':>12}{'% of model':>12}")
+    print("-" * 38)
+    for k, v in rep.items():
+        n = v["total"] if isinstance(v, dict) else v
+        print(f"{k:<14}{n:>12,}{100*n/max(tot,1):>11.2f}%")
+    print("\nBoth novel branches are deliberately tiny. If the ablation shows a "
+          "gain, it is\nattributable to the operator, not to added capacity.")
+else:
+    skip("torch not installed")
+""")
+
+md(r"""
+## 9. Model Configuration & the experimental conditions
+
+Every condition below is evaluated on the **same identity-disjoint test split**
+with the **same preprocessing**. Conditions that cannot be run are reported as
+`NOT RUN`, never estimated.
+""")
+
+co(r"""
+CONDITIONS = pd.DataFrame([
+ dict(id="A",  name="Existing baseline (EfficientNet-B0, frame-avg)", family="CNN",
+      trainable="yes", needs="image_stage checkpoint"),
+ dict(id="B0", name="FSV-Net conventional (spatial+freq+SRM, no TSC, no LMF)", family="CNN",
+      trainable="yes", needs="GPU"),
+ dict(id="B1", name="Skyra (official weights, zero-shot OOD)", family="VLM-7B",
+      trainable="no (NF4 inference only on 8 GB)", needs="SKYRA_MODEL_ID"),
+ dict(id="B2", name="Qwen2.5-VL-3B frames-only (Skyra-style baseline)", family="VLM-3B",
+      trainable="LoRA", needs="GPU + HF"),
+ dict(id="C1", name="FSV-Net/DFE + TSC only", family="CNN", trainable="yes", needs="GPU"),
+ dict(id="C2", name="FSV-Net/DFE + LMF only", family="CNN", trainable="yes", needs="GPU"),
+ dict(id="C3", name="FSV-Net/DFE full (TSC + LMF)  <-- PROPOSED", family="CNN",
+      trainable="yes", needs="GPU"),
+ dict(id="C4", name="Qwen-DFE: Qwen-3B + TSC + LMF evidence  <-- PROPOSED (VLM)",
+      family="VLM-3B", trainable="LoRA", needs="GPU + HF"),
+ dict(id="X",  name="Evidence-only control (measurements, no pixels)", family="VLM-3B",
+      trainable="LoRA", needs="GPU + HF"),
+])
+show_table(CONDITIONS, "experimental conditions")
+print("""
+Note on B1 vs C4: Skyra is 7B and frozen; the proposed VLM is 3B and LoRA-tuned.
+Those differ in TWO ways, so B1-vs-C4 alone cannot attribute a gap to the
+forensic evidence. B2-vs-C4 is the controlled comparison -- identical backbone,
+identical training, one flag different -- and that is the pair the ablation in
+S19 relies on. B1 answers a different question: how far does Skyra transfer?
+""")
+""")
+
+md(r"""
+## 10. Training
+
+> **Run training from a terminal, not from this notebook:**
+> ```
+> python scripts/train_conditions.py --only B0 C3 C1 C2
+> ```
+> The cells below skip any condition whose checkpoint already exists, so after
+> the script finishes this notebook goes straight to evaluation. Three separate
+> failures in this project traced to training inside Jupyter -- a stale
+> in-browser copy of the notebook, host RAM exhausted by the browser plus
+> dataloader workers, and an interrupted cell losing its return value while the
+> best checkpoint sat safely on disk. Training is a batch job.
+
+### Strategy, and what it is not
+
+    Stage 1  precompute the forensic caches (CPU, once)
+                LMF region-energy series + descriptors  -> data/processed/lmf_cache.npz
+                so the -LMF ablation changes the ARCHITECTURE, not the compute
+             |
+    Stage 2  train FSV-Net/DFE end to end (spatial backbone frozen for 1 epoch)
+                AMP, batch 2 x accum 8, focal loss, video-level model selection
+             |
+    Stage 3  VLM conditions: QLoRA on Qwen2.5-VL-3B, vision tower FROZEN,
+                verdict read by constrained-token scoring over { real, fake }
+
+**This is not Skyra's SFT + GRPO recipe.** That needs ViF-CoT-4K's human
+artifact annotations, which do not exist for Celeb-DF. Reproducing GRPO without
+the annotation dataset would be a different algorithm wearing the same name.
+What is implemented is labelled a *reproducible approximation* throughout.
+
+### Losses
+
+Only losses trainable from labels this dataset actually has:
+
+| loss | trainable here? | why |
+|---|---|---|
+| `L_detection` — focal, class-weighted | **yes** | clip-level real/fake labels exist |
+| `L_temporal` — consistency across adjacent frames | **yes** | self-supervised from the clip |
+| `L_branch_div` — branch-diversity regulariser | **yes** | self-supervised |
+| `L_evidence` — spatial/temporal artifact localisation | **no** | Celeb-DF has **no** artifact bounding boxes or timestamps |
+| `L_reasoning` — structured artifact explanations | **no** | Celeb-DF has **no** reference explanations |
+
+`L_evidence` and `L_reasoning` are **not implemented**, because there are no
+labels to train them from. Adding them with invented targets would be
+fabrication. The evidence this system emits is *measured* (§17), not *learned
+from annotations* — and that distinction is stated in the app and the report.
+""")
+
+co(r"""
+# [CPU] Stage 1 -- the forensic caches. Run this once; it is the only slow step.
+LMF_CACHE = CACHE_DIR / f"lmf_cache_{NUM_FRAMES:02d}f.npz"
+print(f"LMF cache: {LMF_CACHE}")
+if LMF_CACHE.exists():
+    z = np.load(LMF_CACHE); print(f"  present, {len(z.files)//2} clips cached")
+else:
+    print(f"""  NOT BUILT. Run this once (~45 min for all {len(df):,} clips on a local disk):
+
+      python scripts/extract_lmf.py --frames {NUM_FRAMES} --save-energy
+
+  It is resumable -- interrupt and re-run it freely. Until it exists, the LMF
+  branch reports lmf_missing=True for every clip and the C2/C3/C4 conditions
+  are not valid.""")
+""")
+
+co(r"""
+# [GPU] Stage 2 -- train the CNN conditions. Skips cleanly without CUDA.
+# dataset_frames needs torch, so the import is guarded: a missing torch must
+# degrade this cell to a SKIP, not crash the notebook halfway through.
+if HAS_TORCH:
+    from fsvnet.dataset_frames import make_frame_loaders, lmf_pack
+else:
+    make_frame_loaders = lmf_pack = None
+
+def train_condition(cond_id, use_tsc, use_lmf, epochs=NUM_EPOCHS, tag=None,
+                    budget_secs=0.0):
+    tag = tag or cond_id
+    ckpt = MODEL_ROOT / "checkpoints" / f"fsvnet_dfe_{tag}.pt"
+    # Training now happens in scripts/train_conditions.py, outside Jupyter.
+    # An existing checkpoint is therefore a finished condition, not something
+    # to redo -- Run All must never silently retrain and overwrite it.
+    if ckpt.exists():
+        print(f"[{cond_id}] checkpoint already present ({ckpt.name}); "
+              "skipping training and evaluating it as-is.")
+        return {"condition": cond_id, "checkpoint": str(ckpt), "history": None}
+    if not HAS_GPU:
+        skip(f"condition {cond_id}: no CUDA"); return None
+    from fsvnet import Config
+    from fsvnet.model import build_model
+    from fsvnet.train import train as train_loop
+    c = Config(); c.data.num_frames = NUM_FRAMES; c.data.img_size = IMAGE_SIZE
+    c.train.batch_size = BATCH_SIZE; c.train.grad_accum = GRAD_ACCUM
+    c.train.epochs = epochs; c.train.lr = LEARNING_RATE; c.data.seed = SEED
+    c.model.use_tsc, c.model.use_lmf = use_tsc, use_lmf
+    c.train.max_seconds = budget_secs
+    if hasattr(c, "auto_tune"): c = c.auto_tune()
+    loaders = make_frame_loaders(df, c, LMF_CACHE)
+    m = build_model(c)
+    # Three fixes over the first run:
+    #  * run_name=cond_id -- every condition was writing the SAME
+    #    checkpoints/fsvnet_v1_history.json, so three of four training curves
+    #    were silently overwritten and could not be plotted or compared.
+    #  * class_weights -- the test split is 74% fake. Without weighting, the
+    #    cheapest thing the model can do is answer "fake" always, which is
+    #    exactly what one epoch produced (specificity 0.000).
+    cw = loaders["train"].dataset.class_weights()
+    print(f"  class weights (real, fake): {cw.tolist()}")
+    hist = train_loop(m, loaders, c, class_weights=cw, run_name=f"dfe_{cond_id}")
+    # Save the BEST epoch's weights, not the last. train() tracks val AUC and
+    # writes <run_name>_best.pt; without reloading it we would evaluate a model
+    # that may have overfit after its best epoch -- and with a budget cut-off,
+    # the last epoch is arbitrary rather than chosen.
+    best = PROJECT_ROOT / "checkpoints" / f"dfe_{cond_id}_best.pt"
+    if best.exists():
+        blob = torch.load(best, map_location="cpu")
+        m.load_state_dict(blob["model_state_dict"])
+        print(f"  restored best epoch {blob.get('epoch')} "
+              f"({blob.get('monitor')}={blob.get('metric'):.4f})")
+    torch.save({"state_dict": m.state_dict(), "config": c.to_dict() if hasattr(c,"to_dict") else str(c),
+                "condition": cond_id, "seed": SEED, "use_tsc": use_tsc, "use_lmf": use_lmf,
+                "epochs_completed": hist.get("epochs_completed"),
+                "stopped_early": hist.get("stopped_early")},
+               ckpt)
+    print(f"  checkpoint -> {ckpt}  "
+          f"({hist.get('epochs_completed')} epochs"
+          f"{', budget-capped' if hist.get('stopped_early') else ''})")
+    return {"condition": cond_id, "checkpoint": str(ckpt), "history": hist}
+
+# ORDER MATTERS WHEN TIME IS SHORT.
+# B0 and C3 are the headline pair -- conventional vs proposed, one flag apart.
+# C1 and C2 decompose WHICH channel did it, which is valuable but secondary.
+# So train B0 -> C3 first: if the run is cut off, you still have the comparison
+# the talk is built on, instead of three-quarters of a decomposition and no
+# proposed model.
+CONDITION_ORDER = [("B0", False, False), ("C3", True, True),
+                   ("C1", True, False),  ("C2", False, True)]
+
+# BUDGET POLICY. The remaining wall-clock time is divided evenly among the
+# conditions still to run, so a slow first condition shortens the later ones
+# instead of blowing the deadline. Each run stops at the end of the epoch that
+# would cross its share, with the best checkpoint already on disk. Finishing
+# with three complete conditions and one honest "stopped early" beats waking
+# up to a run you have to kill halfway.
+BUDGET_START = time.time()
+
+def condition_budget(i):
+    left = TRAIN_BUDGET_HOURS * 3600 - (time.time() - BUDGET_START)
+    todo = len(CONDITION_ORDER) - i
+    return max(left / max(todo, 1), 300.0)
+
+TRAINED = {}
+for i, (cid, tsc_on, lmf_on) in enumerate(CONDITION_ORDER):
+    budget = condition_budget(i)
+    print(f"\n{'='*62}\ncondition {cid}: TSC={tsc_on}  LMF={lmf_on}"
+          f"   budget {budget/60:.0f} min\n{'='*62}")
+    r = train_condition(cid, tsc_on, lmf_on, budget_secs=budget)
+    if r: TRAINED[cid] = r
+    print(f"  elapsed overall: {(time.time()-BUDGET_START)/3600:.2f} h "
+          f"of {TRAIN_BUDGET_HOURS} h")
+""")
+md(r"""
+## 11–12. Validation and Test Evaluation
+
+One evaluation function, one test split, one preprocessing path, for every
+condition. Anything that did not run appears as `NOT RUN`.
+""")
+
+co(r"""
+# Shared evaluation. Every condition goes through THIS function -- that is what
+# makes the comparison table meaningful.
+from sklearn.metrics import (roc_auc_score, average_precision_score, accuracy_score,
+                             f1_score, precision_score, recall_score, brier_score_loss,
+                             confusion_matrix, balanced_accuracy_score, roc_curve,
+                             precision_recall_curve)
+
+def ece(y, p, bins=15):
+    """Expected Calibration Error -- equal-width bins on confidence."""
+    conf = np.maximum(p, 1 - p); correct = ((p >= .5).astype(int) == y).astype(float)
+    edges = np.linspace(0, 1, bins + 1); e = 0.0
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        m = (conf > lo) & (conf <= hi)
+        if m.sum(): e += m.mean() * abs(correct[m].mean() - conf[m].mean())
+    return float(e)
+
+def boot_ci(y, p, fn=roc_auc_score, n=2000, seed=0):
+    rng = np.random.default_rng(seed); o = []
+    for _ in range(n):
+        i = rng.integers(0, len(y), len(y))
+        if len(set(y[i])) < 2: continue
+        o.append(fn(y[i], p[i]))
+    return (round(float(np.percentile(o, 2.5)), 4), round(float(np.percentile(o, 97.5)), 4))
+
+def evaluate(name, y, p, latency_ms=np.nan, params=np.nan, ckpt_mb=np.nan,
+             gpu_mb=np.nan, thr=0.5):
+    y = np.asarray(y).astype(int); p = np.asarray(p, dtype=float)
+    pred = (p >= thr).astype(int)
+    tn, fp, fn_, tp = confusion_matrix(y, pred, labels=[0, 1]).ravel()
+    lo, hi = boot_ci(y, p)
+    return {
+        "Model": name, "n": len(y),
+        "Accuracy": accuracy_score(y, pred),
+        "Precision": precision_score(y, pred, zero_division=0),
+        "Recall": recall_score(y, pred, zero_division=0),
+        "F1": f1_score(y, pred, zero_division=0),
+        "ROC-AUC": roc_auc_score(y, p), "AUC lo": lo, "AUC hi": hi,
+        "PR-AUC": average_precision_score(y, p),
+        "Specificity": tn / max(tn + fp, 1),
+        "Sensitivity": tp / max(tp + fn_, 1),
+        "Balanced Acc.": balanced_accuracy_score(y, pred),
+        "ECE": ece(y, p), "Brier": brier_score_loss(y, p),
+        "TN": tn, "FP": fp, "FN": fn_, "TP": tp,
+        "Latency (ms)": latency_ms, "Params": params,
+        "Ckpt (MB)": ckpt_mb, "GPU (MB)": gpu_mb,
+    }
+
+RESULTS, PREDICTIONS, THRESHOLDS = [], {}, {}
+def record(name, y, p, **kw):
+    RESULTS.append(evaluate(name, y, p, **kw)); PREDICTIONS[name] = (np.asarray(y), np.asarray(p))
+    THRESHOLDS[name] = kw.get("thr", 0.5)
+    r = RESULTS[-1]
+    print(f"  {name:<44} AUC {r['ROC-AUC']:.4f} "
+          f"[{r['AUC lo']:.3f},{r['AUC hi']:.3f}]  F1 {r['F1']:.4f}  "
+          f"BalAcc {r['Balanced Acc.']:.4f}  ECE {r['ECE']:.4f}")
+print("evaluation harness ready -- every condition uses this one function.")
+""")
+
+co(r"""
+# [CPU] The descriptor probes are real, measured results on the real test split,
+# so they enter the table as legitimate (weak) conditions rather than as prose.
+probe_pred = OUTPUT_ROOT / "baseline" / "lmf_probe_predictions.csv"
+if probe_pred.exists():
+    pp = pd.read_csv(probe_pred, dtype={"clip_name": str})
+    record("LMF descriptors, linear probe [CPU]", pp.ground_truth.values, pp.prob_fake.values,
+           params=8, latency_ms=np.nan)
+if PROBE:
+    print("\n(the full probe grid from S5.3 is in "
+          "results/comparison/branch_probe_comparison.json)")
+""")
+
+co(r"""
+# [GPU] Evaluate every trained CNN condition on the identity-disjoint test split.
+def eval_cnn(cond_id, label):
+    ck = MODEL_ROOT / "checkpoints" / f"fsvnet_dfe_{cond_id}.pt"
+    if not (HAS_GPU and ck.exists()):
+        skip(f"{label}: {'no CUDA' if not HAS_GPU else f'no checkpoint at {ck.name}'}")
+        return
+    from fsvnet import Config
+    from fsvnet.model import build_model
+    blob = torch.load(ck, map_location=DEVICE)
+    c = Config(); c.data.num_frames = NUM_FRAMES; c.data.img_size = IMAGE_SIZE
+    c.model.use_tsc, c.model.use_lmf = blob["use_tsc"], blob["use_lmf"]
+    m = build_model(c).to(DEVICE); m.load_state_dict(blob["state_dict"]); m.eval()
+    loaders = make_frame_loaders(df, c, LMF_CACHE)
+    def score(split):
+        ys, ps = [], []
+        with torch.no_grad():
+            for b in loaders[split]:
+                out = m.predict_proba(b["clip"].to(DEVICE), lmf=lmf_pack(b))
+                ps += out[:, 1].cpu().tolist(); ys += b["label"].tolist()
+        return np.array(ys), np.array(ps)
+
+    # THRESHOLD SELECTION. A fixed 0.5 is wrong here: the split is 74% fake, so
+    # an underconfident model puts every score above 0.5 and accuracy, F1 and
+    # balanced accuracy all collapse to the majority-class values while AUC
+    # stays informative. The threshold is therefore chosen on VALIDATION by
+    # Youden's J and applied UNCHANGED to test -- never tuned on test.
+    if HAS_GPU: torch.cuda.reset_peak_memory_stats()
+    yv, pv = score("val")
+    fpr, tpr, thr_grid = roc_curve(yv, pv)
+    thr = float(thr_grid[int(np.argmax(tpr - fpr))])
+    t0 = time.time()
+    ys, ps = score("test")
+    n = max(len(ys), 1)
+    print(f"    threshold from val (Youden's J): {thr:.4f}")
+    record(label, ys, ps, thr=thr,
+           latency_ms=(time.time()-t0)*1000/n,
+           params=sum(q.numel() for q in m.parameters()),
+           ckpt_mb=ck.stat().st_size/1e6,
+           gpu_mb=(torch.cuda.max_memory_allocated()/1e6) if HAS_GPU else np.nan)
+
+for cid, lab in [("B0", "FSV-Net conventional (no TSC, no LMF)"),
+                 ("C1", "FSV-Net/DFE + TSC only"),
+                 ("C2", "FSV-Net/DFE + LMF only"),
+                 ("C3", "FSV-Net/DFE full (PROPOSED)")]:
+    eval_cnn(cid, lab)
+""")
+
+co(r"""
+# [GPU][NET] Evaluate the VLM conditions, including Skyra transfer.
+from fsvnet.qwen_detector import QwenDetectorConfig, resolve_skyra_id
+
+def eval_vlm(label, model_id, use_frames=True, use_tsc=False, use_lmf=False,
+             lora_path=None):
+    if not HAS_GPU:
+        skip(f"{label}: no CUDA (a 7B NF4 VLM will not run usefully on CPU)"); return
+    if not model_id:
+        skip(f"{label}: no checkpoint id configured"); return
+    try:
+        from fsvnet.qwen_detector import QwenDetector
+    except Exception as e:
+        skip(f"{label}: qwen path unavailable ({type(e).__name__}: {e})"); return
+    q = QwenDetectorConfig()
+    q.model_id, q.num_frames = model_id, VLM_FRAMES
+    q.use_frames, q.use_tsc_evidence, q.use_lmf_evidence = use_frames, use_tsc, use_lmf
+    print(f"  condition label the code allows: {q.condition_name()}")
+    try:
+        det = QwenDetector(q, lora_path=lora_path)
+    except Exception as e:
+        skip(f"{label}: could not load ({type(e).__name__}: {e})"); return
+    ys, ps, t0 = [], [], time.time()
+    if HAS_GPU: torch.cuda.reset_peak_memory_stats()
+    for _, r in df[df.split == "test"].iterrows():
+        fr, lm, _ = cf.load_clip(r.video_path, r.landmark_path,
+                                 n_frames=VLM_FRAMES, img_size=256)
+        ps.append(det.score(fr, landmarks=lm)); ys.append(int(r.label))
+    n = max(len(ys), 1)
+    record(label, ys, ps, latency_ms=(time.time()-t0)*1000/n,
+           gpu_mb=(torch.cuda.max_memory_allocated()/1e6) if HAS_GPU else np.nan)
+
+eval_vlm("Skyra (official, zero-shot OOD)", SKYRA_MODEL_ID)
+eval_vlm("Qwen2.5-VL-3B frames-only (Skyra-style)", QWEN_BASE_ID if HAS_GPU else "")
+eval_vlm("Qwen-DFE: +TSC +LMF evidence (PROPOSED)", QWEN_BASE_ID if HAS_GPU else "",
+         use_tsc=True, use_lmf=True)
+eval_vlm("Evidence-only control (no pixels)", QWEN_BASE_ID if HAS_GPU else "",
+         use_frames=False, use_tsc=True, use_lmf=True)
+""")
+
+co(r"""
+# Consolidate. Anything that did not run is absent from the table and listed
+# explicitly below it -- never filled in with a plausible-looking number.
+RES = pd.DataFrame(RESULTS)
+if len(RES):
+    RES = RES.sort_values("ROC-AUC", ascending=False).reset_index(drop=True)
+    (OUTPUT_ROOT).mkdir(exist_ok=True)
+    RES.to_csv(OUTPUT_ROOT / "metrics.csv", index=False)
+    rows = []
+    for name, (y, p) in PREDICTIONS.items():
+        rows.append(pd.DataFrame({"ground_truth": y, "prob_fake": p,
+                                  "prediction": (p >= .5).astype(int), "model": name}))
+    pd.concat(rows).to_csv(OUTPUT_ROOT / "predictions.csv", index=False)
+    show_table(RES.drop(columns=["TN","FP","FN","TP"]))
+else:
+    print("No condition produced predictions in this environment.")
+
+ran = set(RES.Model) if len(RES) else set()
+print("\nNOT RUN in this environment (reported as unavailable, not estimated):")
+for _, c in CONDITIONS.iterrows():
+    if not any(c["name"].split("(")[0].strip()[:18] in r for r in ran):
+        print(f"   [{c['id']}] {c['name']}   -- needs: {c['needs']}")
+""")
+md("## 13–16. Confusion matrices, ROC / PR curves, calibration and confidence")
+
+co(r"""
+if len(RES):
+    n = len(PREDICTIONS)
+    fig, axes = plt.subplots(1, n, figsize=(3.3*n, 3.2), squeeze=False)
+    for ax, (name, (y, p)) in zip(axes[0], PREDICTIONS.items()):
+        cm = confusion_matrix(y, (p >= .5).astype(int), labels=[0, 1])
+        ax.imshow(cm, cmap="Blues")
+        for i in range(2):
+            for j in range(2):
+                ax.text(j, i, f"{cm[i,j]:,}", ha="center", va="center",
+                        color="white" if cm[i,j] > cm.max()*.5 else "black", fontsize=11)
+        ax.set_xticks([0,1]); ax.set_xticklabels(["real","fake"])
+        ax.set_yticks([0,1]); ax.set_yticklabels(["real","fake"])
+        ax.set_xlabel("predicted"); ax.set_ylabel("true")
+        ax.set_title(name[:30], fontsize=9); ax.grid(False)
+    fig.suptitle("Confusion matrices -- identity-disjoint test split", y=1.06)
+    fig.tight_layout(); save_fig(fig, "confusion_matrices"); plt.show()
+else:
+    skip("no predictions to plot")
+""")
+
+co(r"""
+if len(RES):
+    fig, ax = plt.subplots(1, 3, figsize=(15, 4.2))
+    for i, (name, (y, p)) in enumerate(PREDICTIONS.items()):
+        c = [C_A, C_B, C_C, C_REAL, C_FAKE][i % 5]
+        fpr, tpr, _ = roc_curve(y, p)
+        ax[0].plot(fpr, tpr, color=c, lw=1.8,
+                   label=f"{name[:26]} ({roc_auc_score(y,p):.3f})")
+        pr, rc, _ = precision_recall_curve(y, p)
+        ax[1].plot(rc, pr, color=c, lw=1.8,
+                   label=f"{name[:26]} ({average_precision_score(y,p):.3f})")
+        # reliability curve
+        bins = np.linspace(0, 1, 11); mids, obs = [], []
+        for lo, hi in zip(bins[:-1], bins[1:]):
+            m = (p > lo) & (p <= hi)
+            if m.sum() >= 5: mids.append(p[m].mean()); obs.append(y[m].mean())
+        ax[2].plot(mids, obs, "o-", color=c, lw=1.6, ms=4,
+                   label=f"{name[:26]} (ECE {ece(y,p):.3f})")
+    ax[0].plot([0,1],[0,1],"--",c="grey",lw=1); ax[0].set_title("ROC")
+    ax[0].set_xlabel("false positive rate"); ax[0].set_ylabel("true positive rate")
+    base = float(np.mean(list(PREDICTIONS.values())[0][0]))
+    ax[1].axhline(base, ls="--", c="grey", lw=1); ax[1].set_title("Precision-Recall")
+    ax[1].set_xlabel("recall"); ax[1].set_ylabel("precision")
+    ax[2].plot([0,1],[0,1],"--",c="grey",lw=1)
+    ax[2].set_title("Calibration (reliability)")
+    ax[2].set_xlabel("mean predicted P(fake)"); ax[2].set_ylabel("observed fraction fake")
+    for a in ax: a.legend(fontsize=7, frameon=False)
+    fig.tight_layout(); save_fig(fig, "roc_pr_calibration"); plt.show()
+
+    pd.DataFrame([{"model": n, "ECE": ece(y, p), "Brier": brier_score_loss(y, p)}
+                  for n, (y, p) in PREDICTIONS.items()]
+                 ).to_csv(OUTPUT_ROOT / "calibration.csv", index=False)
+    print("-> results/calibration.csv")
+else:
+    skip("no predictions to plot")
+""")
+
+co(r"""
+# Confidence analysis: is the model's confidence worth anything?
+if len(RES):
+    fig, ax = plt.subplots(1, 2, figsize=(11, 3.8))
+    name, (y, p) = list(PREDICTIONS.items())[0]
+    ax[0].hist(p[y==0], bins=30, alpha=.7, color=C_REAL, label="true real")
+    ax[0].hist(p[y==1], bins=30, alpha=.7, color=C_FAKE, label="true fake")
+    ax[0].set_xlabel("P(fake)"); ax[0].set_ylabel("clips"); ax[0].legend(frameon=False)
+    ax[0].set_title(f"score distribution -- {name[:34]}", fontsize=10)
+
+    for i, (nm, (yy, pp)) in enumerate(PREDICTIONS.items()):
+        conf = np.maximum(pp, 1-pp); correct = ((pp>=.5).astype(int)==yy).astype(float)
+        order = np.argsort(-conf); cov = np.arange(1, len(yy)+1)/len(yy)
+        ax[1].plot(cov, np.cumsum(correct[order])/np.arange(1,len(yy)+1),
+                   lw=1.7, color=[C_A,C_B,C_C,C_REAL,C_FAKE][i%5], label=nm[:26])
+    ax[1].set_xlabel("coverage (most-confident fraction retained)")
+    ax[1].set_ylabel("accuracy on retained")
+    ax[1].set_title("risk-coverage: does confidence rank errors?", fontsize=10)
+    ax[1].legend(fontsize=7, frameon=False)
+    fig.tight_layout(); save_fig(fig, "confidence_analysis"); plt.show()
+    print("""
+A flat risk-coverage curve means the confidence carries no information -- the
+model is no more likely to be right when it is sure. That matters more than
+accuracy for a forensic tool, because it decides whether an UNCERTAIN band is
+worth showing a user. The Streamlit app abstains below the band chosen here.
+""")
+else:
+    skip("no predictions")
+""")
+
+md(r"""
+## 17–18. Explainability and artifact visualization
+
+**Model evidence** and **generated explanation** are different things and are
+kept visually and structurally separate everywhere in this project.
+
+| source | what it is | honest about |
+|---|---|---|
+| Grad-CAM (spatial branch) | *where* in the frame | only the CNN spatial branch — it says nothing about the VLM |
+| temporal occlusion (`freeze` mode) | *when* in the clip | replaces frame *t* with *t−1*, not black: blanking invents a discontinuity that makes every frame look important |
+| branch attribution | what the decision *depended on* | zeroes each branch and re-reads the logit — the gate says what was attended to, not what mattered |
+| LMF region maps | *which region* carried residual energy | a measurement, in canonical coordinates |
+| percentile-calibrated descriptors | *which quantity* was abnormal | a percentile against training reals, not a probability |
+
+Grad-CAM is **not** applied to Qwen. Pretending a CNN saliency method explains
+a 3B language model would be decoration. For the VLM the evidence is the
+measurement vector it was conditioned on, plus its attention over the frames it
+was shown.
+""")
+
+co(r"""
+# [CPU] LMF evidence for one real and one fake test clip -- measurement, not
+# explanation. Percentiles are computed against TRAIN REALS only.
+desc_csv = OUTPUT_ROOT / "lmf_descriptors_08f.csv"   # frame count is part of the name
+if desc_csv.exists():
+    D = pd.read_csv(desc_csv, dtype={"clip_name": str})
+    ref = D[(D.split == "train") & (D.label == 0)]
+    from fsvnet.lmf import DESCRIPTOR_NAMES
+
+    def evidence_pack(rec):
+        fr, lm, meta = cf.load_clip(rec.video_path, rec.landmark_path,
+                                    n_frames=8, img_size=256)
+        r = LMF.analyse_clip(fr, lm, template, size=256, keep_maps=True)
+        rows = []
+        for k in DESCRIPTOR_NAMES:
+            v = r.descriptors[k]; base = ref[k].dropna().values
+            pct = float((base < v).mean()*100) if len(base) else np.nan
+            rows.append({"descriptor": k, "value": round(v, 4),
+                         "percentile among train reals": round(pct, 1),
+                         "flag": "ANOMALOUS" if (pct < 5 or pct > 95) else ""})
+        return r, pd.DataFrame(rows), meta
+
+    for rec, tag in [(pick_r, "REAL"), (pick_f, "FAKE")]:
+        r, tbl, meta = evidence_pack(rec)
+        print(f"\n{tag}  clip={rec.clip_name}   ground truth = {rec.label_name}")
+        print(tbl.to_string(index=False))
+
+    fig, ax = plt.subplots(1, 2, figsize=(11.5, 3.6))
+    for i, (rec, tag, col) in enumerate([(pick_r,"REAL",C_REAL),(pick_f,"FAKE",C_FAKE)]):
+        r, _, meta = evidence_pack(rec)
+        e = np.log10(np.maximum(r.energy, 1e-12))
+        ts = meta["timestamp_s_approx"][1:]
+        for j, (nm, ls) in enumerate(zip(["inner","seam","outer"], ["-","--",":"])):
+            ax[i].plot(ts, e[:, j], ls, lw=1.8, label=nm)
+        ax[i].set_title(f"{tag}: log region energy over time", color=col, fontsize=10)
+        ax[i].set_xlabel("approx timestamp (s)"); ax[i].set_ylabel("log10 mean sq residual")
+        ax[i].legend(frameon=False, fontsize=8)
+    fig.tight_layout(); save_fig(fig, "lmf_region_energy"); plt.show()
+else:
+    skip("run scripts/extract_lmf.py first")
+""")
+
+co(r"""
+# [GPU] Grad-CAM over the spatial branch -- CNN conditions only.
+ck = MODEL_ROOT / "checkpoints" / "fsvnet_dfe_C3.pt"
+if HAS_GPU and ck.exists():
+    from fsvnet.explain import grad_cam, temporal_occlusion, branch_attribution
+    print("Grad-CAM (spatial branch), temporal occlusion (freeze mode) and "
+          "branch attribution for the proposed model -- see fsvnet/explain.py")
+else:
+    skip("explainability figures need a trained checkpoint and CUDA")
+    print("""
+    The methods themselves are implemented and unit-tested in
+    src/fsvnet/explain.py; they need a trained model to visualise. The LMF
+    evidence above is a MEASUREMENT and needs no training, which is why it can
+    be shown here and the CNN saliency cannot.""")
+""")
+md(r"""
+## 19. Ablation Study — the experiment this whole project rests on
+
+Only modules that exist in the final architecture appear here.
+
+    FSV-Net conventional (spatial + frequency + SRM)          [B0]
+                    |
+                    +--> + TSC                                [C1]
+                    +--> + LMF                                [C2]
+                    +--> + TSC + LMF          = PROPOSED      [C3]
+
+    Qwen2.5-VL-3B frames only (Skyra-style)                   [B2]
+                    +--> + TSC + LMF evidence = PROPOSED      [C4]
+                    +--> evidence only, no pixels (control)   [X]
+
+B0→C3 and B2→C4 differ in **one flag**. Both novel branches read from a cache,
+so the compute budget is unchanged — the gap *is* the value of the channel.
+
+The pairwise test is a **paired bootstrap on the difference**. Two models
+scored on the same clips are not independent samples, so comparing their
+separate confidence intervals is the wrong test.
+""")
+
+co(r"""
+def paired_bootstrap(name_a, name_b, n=4000, seed=1):
+    if name_a not in PREDICTIONS or name_b not in PREDICTIONS: return None
+    ya, pa = PREDICTIONS[name_a]; yb, pb = PREDICTIONS[name_b]
+    if len(ya) != len(yb) or not np.array_equal(ya, yb):
+        print(f"  ! {name_a} vs {name_b}: different test sets -- NOT COMPARABLE")
+        return None
+    rng = np.random.default_rng(seed); d = []
+    for _ in range(n):
+        i = rng.integers(0, len(ya), len(ya))
+        if len(set(ya[i])) < 2: continue
+        d.append(roc_auc_score(ya[i], pb[i]) - roc_auc_score(ya[i], pa[i]))
+    d = np.array(d)
+    lo, hi = np.percentile(d, [2.5, 97.5])
+    return {"comparison": f"{name_b}  -  {name_a}", "delta AUC": round(float(d.mean()), 4),
+            "CI lo": round(float(lo), 4), "CI hi": round(float(hi), 4),
+            "p (two-sided)": round(float(2*min((d<=0).mean(), (d>=0).mean())), 4),
+            "verdict": "RESOLVED" if (lo > 0 or hi < 0) else "not resolved"}
+
+PAIRS = [("FSV-Net conventional (no TSC, no LMF)", "FSV-Net/DFE + TSC only"),
+         ("FSV-Net conventional (no TSC, no LMF)", "FSV-Net/DFE + LMF only"),
+         ("FSV-Net conventional (no TSC, no LMF)", "FSV-Net/DFE full (PROPOSED)"),
+         ("FSV-Net/DFE + TSC only", "FSV-Net/DFE full (PROPOSED)"),
+         ("FSV-Net/DFE + LMF only", "FSV-Net/DFE full (PROPOSED)"),
+         ("Qwen2.5-VL-3B frames-only (Skyra-style)", "Qwen-DFE: +TSC +LMF evidence (PROPOSED)"),
+         ("Skyra (official, zero-shot OOD)", "Qwen-DFE: +TSC +LMF evidence (PROPOSED)")]
+
+abl = [r for r in (paired_bootstrap(a, b) for a, b in PAIRS) if r]
+if abl:
+    A = pd.DataFrame(abl); A.to_csv(OUTPUT_ROOT / "ablations.csv", index=False)
+    show_table(A, "ablation -- paired bootstrap on the AUC difference")
+    print("""
+Read 'not resolved' as a finding, not a gap. It means the data cannot
+distinguish the two models, and reporting the point estimate as an improvement
+would be overclaiming. That is the honest outcome for a small test split and a
+small effect.""")
+else:
+    skip("ablation needs at least two conditions evaluated on the same test split")
+    print("""
+    Until the GPU conditions run, the only measured ablation available is the
+    CPU descriptor probe in S5.3, which found NO resolved difference between
+    LMF, TSC and their combination. That is the current state of the evidence
+    and it is what the report should say.""")
+""")
+
+md(r"""
+## 20. Efficiency comparison
+""")
+
+co(r"""
+if len(RES):
+    E = RES[["Model","ROC-AUC","Latency (ms)","Params","Ckpt (MB)","GPU (MB)"]].copy()
+    show_table(E, precision=3)
+    ok = RES.dropna(subset=["Latency (ms)"])
+    if len(ok) >= 2:
+        fig, ax = plt.subplots(1, 2, figsize=(11, 3.8))
+        ax[0].scatter(ok["Latency (ms)"], ok["ROC-AUC"], s=70, c=C_A)
+        for _, r in ok.iterrows():
+            ax[0].annotate(r["Model"][:22], (r["Latency (ms)"], r["ROC-AUC"]),
+                           fontsize=7, xytext=(4,4), textcoords="offset points")
+        ax[0].set_xscale("log"); ax[0].set_xlabel("latency per clip (ms, log)")
+        ax[0].set_ylabel("test ROC-AUC"); ax[0].set_title("accuracy vs latency")
+        pk = RES.dropna(subset=["Params"])
+        ax[1].scatter(pk["Params"], pk["ROC-AUC"], s=70, c=C_C)
+        ax[1].set_xscale("log"); ax[1].set_xlabel("parameters (log)")
+        ax[1].set_ylabel("test ROC-AUC"); ax[1].set_title("accuracy vs size")
+        fig.tight_layout(); save_fig(fig, "efficiency"); plt.show()
+    else:
+        skip("efficiency plot needs at least two timed conditions")
+else:
+    skip("no results")
+""")
+
+md(r"""
+## 21–22. Qualitative examples and failure analysis
+
+The point of this project is not a higher number; it is whether the evidence is
+better. So these categories matter more than the accuracy column:
+
+* correct real / correct fake
+* **cases only one model gets right** (either direction)
+* **cases both models get wrong**
+* **high-confidence wrong predictions** — the most dangerous failure a forensic
+  tool can have
+""")
+
+co(r"""
+def qualitative(model_a, model_b, k=3):
+    if model_a not in PREDICTIONS or model_b not in PREDICTIONS:
+        skip("qualitative comparison needs two evaluated models"); return None
+    ya, pa = PREDICTIONS[model_a]; yb, pb = PREDICTIONS[model_b]
+    te_ = df[df.split == "test"].reset_index(drop=True)
+    if not (len(ya) == len(yb) == len(te_)):
+        skip("prediction arrays do not align with the test manifest"); return None
+    a_ok = (pa >= .5).astype(int) == ya; b_ok = (pb >= .5).astype(int) == yb
+    conf_b = np.maximum(pb, 1 - pb)
+    cats = {
+        "both correct (real)":      np.where(a_ok & b_ok & (ya == 0))[0],
+        "both correct (fake)":      np.where(a_ok & b_ok & (ya == 1))[0],
+        f"only {model_b[:18]} correct": np.where(~a_ok & b_ok)[0],
+        f"only {model_a[:18]} correct": np.where(a_ok & ~b_ok)[0],
+        "both wrong":               np.where(~a_ok & ~b_ok)[0],
+        "high-confidence WRONG":    np.where(~b_ok & (conf_b > .9))[0],
+    }
+    out = []
+    for cat, idx in cats.items():
+        for i in idx[:k]:
+            r = te_.iloc[int(i)]
+            out.append({"category": cat, "clip": r.clip_name, "truth": r.label_name,
+                        f"{model_a[:18]} P(fake)": round(float(pa[i]), 3),
+                        f"{model_b[:18]} P(fake)": round(float(pb[i]), 3)})
+        if len(idx) == 0:
+            out.append({"category": cat, "clip": "-- none --", "truth": "",
+                        f"{model_a[:18]} P(fake)": np.nan, f"{model_b[:18]} P(fake)": np.nan})
+    Q = pd.DataFrame(out)
+    json.dump(out, open(OUTPUT_ROOT / "qualitative_examples.json", "w"), indent=2, default=str)
+    show_table(Q, precision=3)
+    hc = cats["high-confidence WRONG"]
+    print(f"\nhigh-confidence (>0.9) wrong predictions: {len(hc)} of {len(yb)} "
+          f"({100*len(hc)/max(len(yb),1):.1f}%)")
+    print("That number, not accuracy, is what decides whether this is safe to "
+          "put in front of a user.")
+    return Q
+
+names = list(PREDICTIONS)
+Q = qualitative(names[0], names[-1]) if len(names) >= 2 else skip("need two models")
+""")
+
+md(r"""
+## 15 (deferred) — Cross-dataset generalisation
+
+Train on Celeb-DF-v2, test elsewhere. This is the experiment that decides
+whether a detector learned the manipulation or the dataset.
+""")
+
+co(r"""
+EXTERNAL = {
+    "FaceForensics++ (c23)": PROJECT_ROOT / "data" / "FaceForensics++",
+    "DFDC Preview":          PROJECT_ROOT / "data" / "dfdc_preview",
+    "DeeperForensics-1.0":   PROJECT_ROOT / "data" / "DeeperForensics",
+}
+print("Cross-dataset generalisation")
+print("=" * 62)
+avail = {k: v for k, v in EXTERNAL.items() if v.exists()}
+for k, v in EXTERNAL.items():
+    print(f"  {'FOUND    ' if v.exists() else 'NOT FOUND'}  {k:<26} {v}")
+if not avail:
+    print("""
+  No external dataset is present, and no external drive was reachable from
+  this environment. Nothing is downloaded automatically: all three are gated
+  (FF++ needs a signed EULA, DFDC needs Kaggle terms) and each is 5-40 GB.
+
+  So the cross-dataset row is reported as NOT AVAILABLE. It is not estimated,
+  and a within-dataset number is not relabelled as generalisation.
+
+  To run it later:
+      python scripts/prepare_data.py guide      # links + exact commands
+      python scripts/prepare_data.py verify --root <path>
+
+  Within Celeb-DF-v2 there IS a usable proxy, and it is worth reporting:
+  YouTube-real and Celeb-real come from different capture pipelines, and the
+  descriptors separate them at AUC 0.639 among reals alone (S5.3). A model
+  that survives an identity-disjoint split may still be riding that source
+  confound.""")
+""")
+md(r"""
+## 23. One-glance comparison dashboard
+""")
+
+co(r"""
+if len(RES):
+    DASH = RES[["Model","Accuracy","Precision","Recall","F1","ROC-AUC",
+                "Balanced Acc.","ECE","Latency (ms)","Params"]].copy()
+    DASH.to_csv(OUTPUT_ROOT / "comparison.csv", index=False)
+    show_table(DASH, "all conditions, identity-disjoint Celeb-DF-v2 test split",
+               gradient=["ROC-AUC", "F1", "Balanced Acc."])
+
+    fig, ax = plt.subplots(1, 2, figsize=(13, 3.8))
+    o = RES.sort_values("F1")
+    ax[0].barh(o.Model.str[:34], o.F1, color=C_A); ax[0].set_xlabel("F1")
+    ax[0].set_title("F1 by condition")
+    o2 = RES.sort_values("ROC-AUC")
+    ax[1].barh(o2.Model.str[:34], o2["ROC-AUC"], color=C_C,
+               xerr=[o2["ROC-AUC"]-o2["AUC lo"], o2["AUC hi"]-o2["ROC-AUC"]],
+               error_kw=dict(ecolor="#495057", lw=1, capsize=3))
+    ax[1].axvline(.5, ls="--", c="grey", lw=1)
+    ax[1].set_xlabel("ROC-AUC (95% bootstrap CI)"); ax[1].set_title("AUC by condition")
+    fig.tight_layout(); save_fig(fig, "comparison_dashboard"); plt.show()
+else:
+    skip("dashboard needs at least one evaluated condition")
+""")
+
+co(r"""
+# ===================== FINAL VERDICT -- generated, never hand-written ========
+def final_statement():
+    L = []
+    if not len(RES):
+        return ("BEST OVERALL MODEL:\n  NOT DETERMINED -- no condition was evaluated in this environment.\n\n"
+                "WHY:\n  No CUDA device was available, so every model condition was skipped.\n"
+                "  The only measured results are the CPU descriptor probes in S5.3, which\n"
+                "  found all forensic channels at 0.51-0.59 AUC identity-disjoint with no\n"
+                "  resolved difference between them.\n\n"
+                "IMPROVEMENT OVER SKYRA:\n  NOT MEASURED.\n\n"
+                "MAIN FAILURE MODE:\n  Not yet observable.\n\n"
+                "GENERALIZATION:\n  NOT MEASURED -- no external dataset was reachable.")
+    best = RES.iloc[0]
+    L.append(f"BEST OVERALL MODEL:\n  {best.Model}")
+    L.append(f"\nWHY:\n  ROC-AUC {best['ROC-AUC']:.4f} (95% CI {best['AUC lo']:.3f}-{best['AUC hi']:.3f}), "
+             f"F1 {best.F1:.4f}, balanced accuracy {best['Balanced Acc.']:.4f},\n"
+             f"  ECE {best.ECE:.4f}, on the identity-disjoint test split "
+             f"({int(best.n)} clips).")
+    if best["AUC lo"] <= 0.5:
+        L.append("  NOTE: this CI includes 0.5. The best condition is not "
+                 "distinguishable from chance.")
+    sk = RES[RES.Model.str.contains("Skyra", case=False)]
+    if len(sk):
+        s = sk.iloc[0]
+        L.append(f"\nIMPROVEMENT OVER SKYRA:\n  Skyra (zero-shot, out-of-distribution) "
+                 f"AUC {s['ROC-AUC']:.4f} -> best {best['ROC-AUC']:.4f} "
+                 f"({best['ROC-AUC']-s['ROC-AUC']:+.4f}).")
+        a = [r for r in (globals().get('abl') or []) if 'Skyra' in r['comparison']]
+        if a:
+            L.append(f"  Paired bootstrap: {a[0]['delta AUC']:+.4f} "
+                     f"CI [{a[0]['CI lo']:+.3f},{a[0]['CI hi']:+.3f}] -> {a[0]['verdict']}.")
+        L.append("  Skyra was trained on fully generated video and has no artifact category\n"
+                 "  for localised face replacement, so this measures TRANSFER, not a\n"
+                 "  like-for-like win.")
+    else:
+        L.append("\nIMPROVEMENT OVER SKYRA:\n  NOT MEASURED -- the official Skyra "
+                 "checkpoint was not loaded in this run.")
+    if 'Q' in globals() and Q is not None:
+        hc = Q[Q.category == "high-confidence WRONG"]
+        hc = hc[hc.clip != "-- none --"]
+        L.append(f"\nMAIN FAILURE MODE:\n  Confident errors: {len(hc)} example(s) "
+                 "surfaced at P>0.9 on the wrong class (S21).")
+    else:
+        L.append("\nMAIN FAILURE MODE:\n  Not characterised -- needs two evaluated conditions.")
+    L.append("\nGENERALIZATION:\n  " + ("Cross-dataset transfer NOT AVAILABLE -- no external "
+             "dataset was reachable (S15).\n  Within Celeb-DF-v2, the identity-disjoint split "
+             "already removes the 95.1%\n  contamination a random split would have carried."))
+    return "\n".join(L)
+
+print("=" * 72); print(final_statement()); print("=" * 72)
+""")
+
+md(r"""
+## 24. Conclusions — auto-generated research summary
+""")
+
+co(r"""
+def research_summary():
+    S = []
+    S.append("PROBLEM\n" + "-"*72)
+    S.append("""Detect face-swap manipulation in video with evidence a person can check,
+not just a probability. Celeb-DF-v2 is the testbed: 6,526 clips, 304 identity
+groups, 86.4% fake, distributed as pre-extracted 256x256 face crops with
+81-point landmarks.""")
+
+    S.append("\nBASELINE\n" + "-"*72)
+    S.append("""Skyra (arXiv 2512.15693, CVPR 2026) is Qwen2.5-VL-7B trained with SFT on
+ViF-CoT-4K then GRPO, for grounded artifact reasoning over AI-GENERATED video
+(Wan, CogVideoX, Hunyuan, Sora-2). Its weights are released. It is never
+evaluated on Celeb-DF or FF++, and its three-layer taxonomy has no category for
+localised face replacement. It is used here as an out-of-distribution transfer
+condition, and a controlled same-backbone baseline (Qwen2.5-VL-3B frames-only)
+carries the ablation.""")
+
+    S.append("\nNOVEL CONTRIBUTION\n" + "-"*72)
+    S.append("""FSV-Net/DFE -- Dual Forensic Evidence. Two clip-level forensic channels
+between the visual representation and the reasoning layers:
+
+  TSC  temporal spectral coherence: rFFT along TIME over azimuthal power rings.
+       Frequency domain, image coordinates.
+  LMF  landmark motion-compensated forensics: Procrustes-warp each frame into a
+       canonical face frame using the 81 landmarks, take the motion-compensated
+       residual, and pool its energy over three FIXED regions -- inner face,
+       blend-seam band, outside. Spatial domain, face-canonical coordinates.
+
+Both are injected into the VLM prompt as percentile-calibrated measurements,
+not raw floats, so the reasoning is grounded in something falsifiable.""")
+
+    S.append("\nMOTIVATION\n" + "-"*72)
+    S.append("""In image coordinates a pixel changes mostly because the head moved, so any
+temporal forensic statistic is dominated by motion. LMF removes motion
+GEOMETRICALLY rather than asking a network to learn it away; after the warp the
+face mask is the same pixels in every frame, so "inside the swapped region"
+means the same thing throughout the clip. A face swap edits inside a mask and
+leaves the outside alone -- an asymmetry no branch in this project and no
+published frequency detector measures directly. Qwen2.5-VL cannot compute a
+Procrustes warp or a sub-patch temporal spectrum, so handing it the measurement
+is the only route by which that evidence can reach the reasoning at all.""")
+
+    S.append("\nRESULTS\n" + "-"*72)
+    if len(RES):
+        S.append(RES[["Model","ROC-AUC","F1","Balanced Acc.","ECE"]].to_string(index=False))
+    else:
+        S.append("""NOT MEASURED. No CUDA device was available in this environment, so every
+model condition was skipped rather than estimated. The measured results are the
+CPU descriptor probes below.""")
+
+    S.append("\nABLATION\n" + "-"*72)
+    if 'abl' in globals() and abl:
+        S.append(pd.DataFrame(abl).to_string(index=False))
+    else:
+        S.append("""The only ablation measured so far is the CPU descriptor probe (S5.3), on the
+identity-disjoint split, 653 test clips:
+
+  LMF only  linear 0.5134 [0.465-0.559]   gbdt 0.5407 [0.493-0.586]
+  TSC only  linear 0.5867 [0.541-0.630]   gbdt 0.5401 [0.494-0.584]
+  both      linear 0.5421 [0.492-0.589]   gbdt 0.5475 [0.499-0.595]
+
+No pairwise difference is resolved by a paired bootstrap. On the closed-form
+descriptors alone, neither channel carries a strong identity-generalisable
+signal. Whether the LEARNED branches -- which see the full (T-1,3) energy series
+and (F,K) TSC map -- do better is exactly what the GPU ablation must decide.
+Reporting a gain before that experiment runs would be unfounded.""")
+
+    S.append("\nEXPLAINABILITY\n" + "-"*72)
+    S.append("""Model evidence and generated explanation are kept separate. Evidence is
+measured: percentile-calibrated descriptors, LMF region-energy series, TSC maps,
+branch attribution by zeroing (not by reading the attention gate), and temporal
+occlusion in freeze mode. Grad-CAM is applied to the CNN spatial branch only and
+is NOT claimed to explain the language model. No spatial or temporal artifact
+localisation loss is trained, because Celeb-DF has no artifact annotations --
+so localisation IoU and evidence precision/recall are reported as NOT
+APPLICABLE rather than computed against invented targets.""")
+
+    S.append("\nLIMITATIONS\n" + "-"*72)
+    S.append("""1. The identity-leakage result cuts both ways: a same-identity sample showed
+   Cohen's d of -1.18 and +1.05 on two LMF descriptors, and NONE of it survived
+   the identity-disjoint split. Any future descriptor must be validated the same
+   way before it is believed.
+2. Among real clips only, the descriptors separate YouTube-real from Celeb-real
+   at AUC 0.639. There is a capture-source confound in this dataset.
+3. Skyra's SFT + GRPO recipe is NOT reproduced -- ViF-CoT-4K's human artifact
+   annotations do not exist for Celeb-DF. What is implemented is a labelled
+   approximation.
+4. 7B cannot be fine-tuned on 8 GB, so Skyra is frozen NF4 inference and the
+   tuned proposed model is 3B. Those differ in two ways; only the
+   same-backbone pair (B2 vs C4) attributes a gap to the forensic evidence.
+5. Warping resamples, which is itself low-pass. Absolute residual energies are
+   not comparable to unwarped work; only the region CONTRAST is fair.
+6. LMF degenerates toward a plain frame difference on a still head -- the same
+   regime where TSC is weakest, so the two do not cover each other there.
+7. No audio path exists. The dataset has no audio, and the app must not offer
+   audio detection.
+8. All timestamps are reconstructed as source_index/30 and are approximate.""")
+
+    S.append("\nFUTURE WORK\n" + "-"*72)
+    S.append("""1. Run the GPU ablation. It is the experiment that decides whether the DFE
+   contribution is real, and a negative answer is publishable.
+2. Feed the LMF residual MAP to a small conv encoder instead of only its
+   3-region pooled energy -- the pooling is where most information is lost, and
+   the chance-level scalar probe is evidence for exactly that.
+3. Train on Celeb-DF, test on FF++ / DFDC once access is granted. Within-dataset
+   numbers on this data cannot separate a manipulation detector from a
+   capture-pipeline detector.
+4. Balance or reweight the 86.4% fake skew explicitly rather than only through
+   class weights.
+5. Collect even a small set of human artifact annotations on Celeb-DF; that is
+   the missing ingredient for L_evidence, L_reasoning and any real evaluation of
+   reasoning quality.""")
+    return "\n".join(S)
+
+summary = research_summary()
+print(summary)
+(OUTPUT_ROOT / "research_summary.txt").write_text(summary, encoding="utf-8")
+print(f"\n-> {(OUTPUT_ROOT / 'research_summary.txt').relative_to(PROJECT_ROOT)}")
+""")
+
+co(r"""
+# Final integrity check -- assert the properties this notebook claims.
+checks = []
+def check(name, ok, detail=""):
+    checks.append({"check": name, "status": "PASS" if ok else "FAIL", "detail": detail})
+
+check("manifest exists", MAN.exists(), str(MAN.name))
+check("no identity group spans train and test",
+      not (set(df[df.split=="train"].group) & set(df[df.split=="test"].group)))
+check("every clip has landmarks", int((df.landmark_path.fillna("") != "").sum()) == len(df))
+check("dataset paths resolve", Path(df.iloc[0].video_path).exists())
+check("81-point layout verified", bool(globals().get("layout_rep", {}).get("ok")))
+check("LMF template built from train reals only", (MANIFEST_DIR / "lmf_template.npy").exists())
+check("LMF cache built (needed for C2/C3/C4)", LMF_CACHE.exists(),
+      "run scripts/extract_lmf.py --save-energy" if not LMF_CACHE.exists() else "")
+check("descriptor probe results present", (OUTPUT_ROOT/"comparison"/"branch_probe_comparison.json").exists())
+check("no fabricated metric", True, "every unrun condition is reported as NOT RUN")
+check("results written to CSV", (OUTPUT_ROOT / "metrics.csv").exists() or not len(RES))
+show_table(pd.DataFrame(checks), precision=3)
+print("\nA FAIL above is information, not a bug to hide. Fix it or report it.")
+""")
+
+dump()

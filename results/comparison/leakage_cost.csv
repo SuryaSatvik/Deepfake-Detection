@@ -1,0 +1,4 @@
+Split regime,linear AUC,GBDT AUC,inflation vs honest (linear)
+random split over clips (leaky),0.6147,0.5987,0.1013
+"random split, Celeb subset only (leaky)",0.6093,0.6,0.0959
+identity-disjoint (honest),0.5134,0.5407,0.0

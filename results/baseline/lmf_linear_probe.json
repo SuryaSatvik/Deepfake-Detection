@@ -1,0 +1,53 @@
+{
+  "n_train": 786,
+  "n_test": 653,
+  "test_real": 253,
+  "test_fake": 400,
+  "roc_auc": 0.5134,
+  "roc_auc_ci95": [
+    0.4653,
+    0.5591
+  ],
+  "pr_auc": 0.6147,
+  "accuracy": 0.4839,
+  "balanced_accuracy": 0.5032,
+  "precision": 0.6162,
+  "recall_sensitivity": 0.4175,
+  "specificity": 0.5889,
+  "f1": 0.4978,
+  "brier": 0.2872,
+  "confusion_matrix": {
+    "tn": 149,
+    "fp": 104,
+    "fn": 233,
+    "tp": 167
+  },
+  "univariate_test_auc": {
+    "inner_outer_contrast": 0.5284,
+    "boundary_excess": 0.5522,
+    "inner_instability": 0.5682,
+    "contrast_drift": 0.5311,
+    "seam_periodicity": 0.3954,
+    "geometric_residual": 0.5307,
+    "geometric_jitter": 0.5097
+  },
+  "coefficients": {
+    "inner_outer_contrast": -0.5839,
+    "boundary_excess": 0.4142,
+    "inner_instability": 0.0105,
+    "contrast_drift": -0.0201,
+    "seam_periodicity": 0.0281,
+    "geometric_residual": 0.2956,
+    "geometric_jitter": 0.0724
+  },
+  "leave_one_out_test_auc": {
+    "inner_outer_contrast": 0.5672,
+    "boundary_excess": 0.4752,
+    "inner_instability": 0.5129,
+    "contrast_drift": 0.5145,
+    "seam_periodicity": 0.5177,
+    "geometric_residual": 0.4845,
+    "geometric_jitter": 0.5156
+  },
+  "full_test_auc": 0.5134
+}

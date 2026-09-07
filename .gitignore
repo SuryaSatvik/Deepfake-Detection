@@ -1,0 +1,62 @@
+# Generated artefacts — never commit these
+data/clips/
+data/synthetic/
+data/manifests/*.csv
+data/manifests/*.json
+checkpoints/*.pt
+outputs/plots/*.png
+outputs/predictions/*.csv
+outputs/evidence/*
+outputs/*.json
+outputs/*.csv
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.ipynb_checkpoints/
+
+# --- added for GitHub push: datasets, weights, scratch ---
+Celeb-DF-v2/
+_to_delete/
+.venv/
+venv/
+env/
+
+# Model weights (too large for GitHub)
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.h5
+checkpoints/
+models/checkpoints/
+image_stage/checkpoints/
+
+# Large media / extracted frames
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.npy
+*.npz
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# image_stage extracted frames dataset
+image_stage/data/
+
+# --- chapter write-up: kept local, not part of the code release ---
+*.docx
+report_src/
+preview/
+
+# --- secrets: never commit these ---
+.env
+.env.*
+*.key
+secrets.json

@@ -1,0 +1,13 @@
+Capability,CNN detector (Xception / EfficientNet),CNN + Grad-CAM (explainable baseline),Skyra / Qwen2.5-VL (VLM reasoning),THIS WORK — FSV-Net/DFE
+Output beyond a probability,no,saliency heatmap,prose rationale,measurements + prose grounded in them
+Evidence is a falsifiable number,no,no,no,YES — percentile vs training reals
+Prediction traceable to frame + timestamp,no,partial,partial,YES — video/frame/timestamp/region
+Localises evidence to face geometry,no,heatmap only,no,YES — inner / seam / outside regions
+Measures a cue a human cannot see,no,no,no,YES — temporal spectral coherence
+Uses facial landmark geometry,no,no,no,YES — Procrustes-canonical residual
+Separates 'model evidence' from 'explanation',n/a,no,no,YES — enforced in UI and notebook
+Reports calibration (ECE / Brier),rarely,rarely,not reported,YES
+Reports paired significance tests,rarely,rarely,no,YES — paired bootstrap on the difference
+Publishes negative results,rarely,rarely,n/a,YES — see docs/FINDINGS.md
+Runs on 8 GB consumer GPU,yes,yes,inference only (7B NF4),yes
+Refuses unsupported modalities,n/a,n/a,n/a,YES — audio explicitly refused

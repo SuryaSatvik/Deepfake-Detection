@@ -1,0 +1,59 @@
+# ---------------------------------------------------------------------------
+# FSV-Net/DFE — Dual Forensic Evidence deepfake detection
+#
+# Python 3.10–3.11.  Install torch FIRST, matched to your CUDA version:
+#
+#   RTX 4060 (CUDA 12.1):
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#   CPU only:
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#
+#   then:  pip install -r requirements.txt
+#
+# torch is intentionally NOT pinned here: pinning it breaks the CUDA-variant
+# install above, which is the one that matters on the target machine.
+# ---------------------------------------------------------------------------
+
+# ---- core numerics -------------------------------------------------------
+numpy>=1.24,<2.2
+scipy>=1.10
+pandas>=2.0
+scikit-learn>=1.3
+
+# ---- vision / IO ---------------------------------------------------------
+opencv-python>=4.8          # required by lmf.py (warpAffine, convexHull)
+Pillow>=10.0
+imageio>=2.31
+imageio-ffmpeg>=0.4.9       # video decoding for arbitrary uploads
+
+# ---- plotting ------------------------------------------------------------
+matplotlib>=3.7
+jinja2>=3.1                 # pandas .style; the notebook degrades without it
+
+# ---- notebook ------------------------------------------------------------
+jupyter>=1.0
+ipykernel>=6.25
+ipywidgets>=8.1
+nbformat>=5.9
+
+# ---- CNN backbone --------------------------------------------------------
+timm>=0.9.12
+
+# ---- frontend ------------------------------------------------------------
+streamlit>=1.30
+
+# ---- VLM path (optional; needed only for the Skyra / Qwen conditions) -----
+# On an 8 GB card these are what make Qwen2.5-VL-3B trainable at all.
+transformers>=4.49          # Qwen2.5-VL support
+accelerate>=0.30
+peft>=0.11                  # LoRA / QLoRA
+bitsandbytes>=0.43          # NF4 quantisation  (Linux; on Windows use
+                            #   pip install bitsandbytes --index-url \
+                            #     https://jllllll.github.io/bitsandbytes-windows-webui )
+qwen-vl-utils>=0.0.8
+sentencepiece>=0.2
+safetensors>=0.4
+
+# ---- optional ------------------------------------------------------------
+# mediapipe>=0.10           # face detection for arbitrary uploads (not needed
+#                           # for Celeb-DF-v2: it ships aligned crops)

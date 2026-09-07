@@ -1,0 +1,8 @@
+Model,Test ROC-AUC,Balanced Acc.,ECE
+Existing baseline (EfficientNet-B0),NOT RUN,NOT RUN,NOT RUN
+"FSV-Net conventional (no TSC, no LMF)",NOT RUN,NOT RUN,NOT RUN
+FSV-Net/DFE + TSC only,NOT RUN,NOT RUN,NOT RUN
+FSV-Net/DFE + LMF only,NOT RUN,NOT RUN,NOT RUN
+FSV-Net/DFE full (PROPOSED),NOT RUN,NOT RUN,NOT RUN
+"Skyra (official weights, zero-shot OOD)",NOT RUN,NOT RUN,NOT RUN
+"TSC descriptors, linear probe [CPU, measured]",0.5867 [0.541-0.630],0.5633,n/a (probe)

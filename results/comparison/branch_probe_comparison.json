@@ -1,0 +1,102 @@
+{
+  "n_clips": 2087,
+  "n_test": 653,
+  "test_real": 253,
+  "test_fake": 400,
+  "split": "identity-disjoint (union-find over identity pairs)",
+  "probe_frames_per_clip": 8,
+  "channels": {
+    "LMF only": {
+      "linear": {
+        "auc": 0.5134,
+        "ci95": [
+          0.4653,
+          0.5591
+        ],
+        "pr_auc": 0.6147,
+        "bal_acc": 0.5032,
+        "n_features": 7
+      },
+      "gbdt": {
+        "auc": 0.5407,
+        "ci95": [
+          0.4929,
+          0.5862
+        ],
+        "pr_auc": 0.6553,
+        "bal_acc": 0.5389,
+        "n_features": 7
+      }
+    },
+    "TSC only": {
+      "linear": {
+        "auc": 0.5867,
+        "ci95": [
+          0.5414,
+          0.6297
+        ],
+        "pr_auc": 0.6918,
+        "bal_acc": 0.5633,
+        "n_features": 10
+      },
+      "gbdt": {
+        "auc": 0.5401,
+        "ci95": [
+          0.4938,
+          0.584
+        ],
+        "pr_auc": 0.6502,
+        "bal_acc": 0.5194,
+        "n_features": 10
+      }
+    },
+    "LMF + TSC": {
+      "linear": {
+        "auc": 0.5421,
+        "ci95": [
+          0.4924,
+          0.5893
+        ],
+        "pr_auc": 0.6278,
+        "bal_acc": 0.5167,
+        "n_features": 17
+      },
+      "gbdt": {
+        "auc": 0.5475,
+        "ci95": [
+          0.4991,
+          0.5954
+        ],
+        "pr_auc": 0.6572,
+        "bal_acc": 0.5077,
+        "n_features": 17
+      }
+    }
+  },
+  "paired_bootstrap": {
+    "TSC only - LMF only": {
+      "delta_auc": -0.0,
+      "ci95": [
+        -0.0629,
+        0.0623
+      ],
+      "p_two_sided": 0.9935
+    },
+    "LMF + TSC - LMF only": {
+      "delta_auc": 0.0072,
+      "ci95": [
+        -0.0271,
+        0.0412
+      ],
+      "p_two_sided": 0.682
+    },
+    "LMF + TSC - TSC only": {
+      "delta_auc": 0.0072,
+      "ci95": [
+        -0.0468,
+        0.0595
+      ],
+      "p_two_sided": 0.7955
+    }
+  }
+}

@@ -1,0 +1,4 @@
+Evaluation protocol,Test clips sharing an identity with train,Identity-disjoint,Source
+Random split over clips (common in student/course work),95.1%,no,"measured, scripts/build_celebdf_manifest.py"
+Official Celeb-DF-v2 test list (used by published work),96.5%,no,"measured, this script"
+THIS WORK — union-find identity-disjoint split,0.0%,YES,"measured, asserted in scripts/verify_project.py"

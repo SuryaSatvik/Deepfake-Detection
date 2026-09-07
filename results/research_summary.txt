@@ -1,0 +1,110 @@
+PROBLEM
+------------------------------------------------------------------------
+Detect face-swap manipulation in video with evidence a person can check,
+not just a probability. Celeb-DF-v2 is the testbed: 6,526 clips, 304 identity
+groups, 86.4% fake, distributed as pre-extracted 256x256 face crops with
+81-point landmarks.
+
+BASELINE
+------------------------------------------------------------------------
+Skyra (arXiv 2512.15693, CVPR 2026) is Qwen2.5-VL-7B trained with SFT on
+ViF-CoT-4K then GRPO, for grounded artifact reasoning over AI-GENERATED video
+(Wan, CogVideoX, Hunyuan, Sora-2). Its weights are released. It is never
+evaluated on Celeb-DF or FF++, and its three-layer taxonomy has no category for
+localised face replacement. It is used here as an out-of-distribution transfer
+condition, and a controlled same-backbone baseline (Qwen2.5-VL-3B frames-only)
+carries the ablation.
+
+NOVEL CONTRIBUTION
+------------------------------------------------------------------------
+FSV-Net/DFE -- Dual Forensic Evidence. Two clip-level forensic channels
+between the visual representation and the reasoning layers:
+
+  TSC  temporal spectral coherence: rFFT along TIME over azimuthal power rings.
+       Frequency domain, image coordinates.
+  LMF  landmark motion-compensated forensics: Procrustes-warp each frame into a
+       canonical face frame using the 81 landmarks, take the motion-compensated
+       residual, and pool its energy over three FIXED regions -- inner face,
+       blend-seam band, outside. Spatial domain, face-canonical coordinates.
+
+Both are injected into the VLM prompt as percentile-calibrated measurements,
+not raw floats, so the reasoning is grounded in something falsifiable.
+
+MOTIVATION
+------------------------------------------------------------------------
+In image coordinates a pixel changes mostly because the head moved, so any
+temporal forensic statistic is dominated by motion. LMF removes motion
+GEOMETRICALLY rather than asking a network to learn it away; after the warp the
+face mask is the same pixels in every frame, so "inside the swapped region"
+means the same thing throughout the clip. A face swap edits inside a mask and
+leaves the outside alone -- an asymmetry no branch in this project and no
+published frequency detector measures directly. Qwen2.5-VL cannot compute a
+Procrustes warp or a sub-patch temporal spectrum, so handing it the measurement
+is the only route by which that evidence can reach the reasoning at all.
+
+RESULTS
+------------------------------------------------------------------------
+                                Model  ROC-AUC       F1  Balanced Acc.      ECE
+FSV-Net conventional (no TSC, no LMF) 0.741246 0.851089       0.500000 0.088514
+               FSV-Net/DFE + TSC only 0.737315 0.851089       0.500000 0.126544
+               FSV-Net/DFE + LMF only 0.670559 0.853097       0.507905 0.122011
+          FSV-Net/DFE full (PROPOSED) 0.630675 0.851089       0.500000 0.081021
+  LMF descriptors, linear probe [CPU] 0.513370 0.497765       0.503216 0.163216
+
+ABLATION
+------------------------------------------------------------------------
+                                                           comparison  delta AUC   CI lo   CI hi  p (two-sided)      verdict
+     FSV-Net/DFE + TSC only  -  FSV-Net conventional (no TSC, no LMF)    -0.0042 -0.0315  0.0235         0.7555 not resolved
+     FSV-Net/DFE + LMF only  -  FSV-Net conventional (no TSC, no LMF)    -0.0711 -0.1133 -0.0307         0.0000     RESOLVED
+FSV-Net/DFE full (PROPOSED)  -  FSV-Net conventional (no TSC, no LMF)    -0.1111 -0.1588 -0.0638         0.0000     RESOLVED
+               FSV-Net/DFE full (PROPOSED)  -  FSV-Net/DFE + TSC only    -0.1069 -0.1540 -0.0604         0.0000     RESOLVED
+               FSV-Net/DFE full (PROPOSED)  -  FSV-Net/DFE + LMF only    -0.0400 -0.0558 -0.0254         0.0000     RESOLVED
+
+EXPLAINABILITY
+------------------------------------------------------------------------
+Model evidence and generated explanation are kept separate. Evidence is
+measured: percentile-calibrated descriptors, LMF region-energy series, TSC maps,
+branch attribution by zeroing (not by reading the attention gate), and temporal
+occlusion in freeze mode. Grad-CAM is applied to the CNN spatial branch only and
+is NOT claimed to explain the language model. No spatial or temporal artifact
+localisation loss is trained, because Celeb-DF has no artifact annotations --
+so localisation IoU and evidence precision/recall are reported as NOT
+APPLICABLE rather than computed against invented targets.
+
+LIMITATIONS
+------------------------------------------------------------------------
+1. The identity-leakage result cuts both ways: a same-identity sample showed
+   Cohen's d of -1.18 and +1.05 on two LMF descriptors, and NONE of it survived
+   the identity-disjoint split. Any future descriptor must be validated the same
+   way before it is believed.
+2. Among real clips only, the descriptors separate YouTube-real from Celeb-real
+   at AUC 0.639. There is a capture-source confound in this dataset.
+3. Skyra's SFT + GRPO recipe is NOT reproduced -- ViF-CoT-4K's human artifact
+   annotations do not exist for Celeb-DF. What is implemented is a labelled
+   approximation.
+4. 7B cannot be fine-tuned on 8 GB, so Skyra is frozen NF4 inference and the
+   tuned proposed model is 3B. Those differ in two ways; only the
+   same-backbone pair (B2 vs C4) attributes a gap to the forensic evidence.
+5. Warping resamples, which is itself low-pass. Absolute residual energies are
+   not comparable to unwarped work; only the region CONTRAST is fair.
+6. LMF degenerates toward a plain frame difference on a still head -- the same
+   regime where TSC is weakest, so the two do not cover each other there.
+7. No audio path exists. The dataset has no audio, and the app must not offer
+   audio detection.
+8. All timestamps are reconstructed as source_index/30 and are approximate.
+
+FUTURE WORK
+------------------------------------------------------------------------
+1. Run the GPU ablation. It is the experiment that decides whether the DFE
+   contribution is real, and a negative answer is publishable.
+2. Feed the LMF residual MAP to a small conv encoder instead of only its
+   3-region pooled energy -- the pooling is where most information is lost, and
+   the chance-level scalar probe is evidence for exactly that.
+3. Train on Celeb-DF, test on FF++ / DFDC once access is granted. Within-dataset
+   numbers on this data cannot separate a manipulation detector from a
+   capture-pipeline detector.
+4. Balance or reweight the 86.4% fake skew explicitly rather than only through
+   class weights.
+5. Collect even a small set of human artifact annotations on Celeb-DF; that is
+   the missing ingredient for L_evidence, L_reasoning and any real evaluation of
+   reasoning quality.

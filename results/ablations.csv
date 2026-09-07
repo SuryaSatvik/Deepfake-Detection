@@ -1,0 +1,6 @@
+comparison,delta AUC,CI lo,CI hi,p (two-sided),verdict
+"FSV-Net/DFE + TSC only  -  FSV-Net conventional (no TSC, no LMF)",-0.0042,-0.0315,0.0235,0.7555,not resolved
+"FSV-Net/DFE + LMF only  -  FSV-Net conventional (no TSC, no LMF)",-0.0711,-0.1133,-0.0307,0.0,RESOLVED
+"FSV-Net/DFE full (PROPOSED)  -  FSV-Net conventional (no TSC, no LMF)",-0.1111,-0.1588,-0.0638,0.0,RESOLVED
+FSV-Net/DFE full (PROPOSED)  -  FSV-Net/DFE + TSC only,-0.1069,-0.154,-0.0604,0.0,RESOLVED
+FSV-Net/DFE full (PROPOSED)  -  FSV-Net/DFE + LMF only,-0.04,-0.0558,-0.0254,0.0,RESOLVED

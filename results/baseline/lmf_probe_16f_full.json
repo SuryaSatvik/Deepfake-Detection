@@ -1,0 +1,26 @@
+{
+  "linear": {
+    "auc": 0.5382,
+    "ci95": [
+      0.4989,
+      0.5831
+    ],
+    "pr_auc": 0.7529,
+    "bal_acc": 0.5296
+  },
+  "gbdt": {
+    "auc": 0.5302,
+    "ci95": [
+      0.4896,
+      0.5729
+    ],
+    "pr_auc": 0.7542,
+    "bal_acc": 0.5046
+  },
+  "n_train": 4574,
+  "n_test": 976,
+  "frames": 16,
+  "test_real": 253,
+  "test_fake": 723,
+  "note": "full 6,526-clip dataset, identity-disjoint, closed-form LMF descriptors only"
+}

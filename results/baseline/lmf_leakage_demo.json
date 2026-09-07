@@ -1,0 +1,22 @@
+{
+  "identity_disjoint": {
+    "linear": 0.5134,
+    "gbdt": 0.5407
+  },
+  "random_clip_split": {
+    "linear": 0.6147,
+    "gbdt": 0.5987
+  },
+  "random_split_celeb_only": {
+    "linear": 0.6093,
+    "gbdt": 0.6
+  },
+  "identity_prediction_from_descriptors": {
+    "n_clips": 587,
+    "n_identities": 4,
+    "chance_accuracy": 0.6576,
+    "cv_accuracy": 0.6542,
+    "cv_std": 0.0117
+  },
+  "source_subset_auc_among_reals": 0.6389
+}

@@ -1,0 +1,61 @@
+# FSV-Net/DFE on Celeb-DF-v2 (pre-extracted frames + landmarks).
+# The notebook's cell 1 is the single source of truth; this file mirrors it so
+# the CLI scripts and the notebook cannot drift apart.
+
+paths:
+  celebdf_frames_root: Celeb-DF-v2
+  manifest:            data/manifests/celebdf_v2_identity.csv
+  lmf_cache:           data/processed/lmf_cache.npz
+  lmf_template:        data/manifests/lmf_template.npy
+  checkpoints:         models/checkpoints
+  results:             results
+
+data:
+  num_frames: 16
+  img_size:   224
+  split_by:   identity        # never "random" for a headline number
+  fracs:      [0.70, 0.15, 0.15]
+  seed:       42
+  # JPEG/rescale augmentation is MANDATORY: Celeb-DF reals and fakes went
+  # through different processing chains, and a model never shown recompression
+  # will learn the chain instead of the manipulation.
+  aug_jpeg_quality: [40, 95]
+  aug_downscale:    [0.5, 1.0]
+  aug_prob:         0.5
+
+model:
+  branch_dim:    256
+  use_spatial:   true
+  use_frequency: true
+  use_srm:       true
+  use_tsc:       true         # novel branch 1 — frequency / time
+  use_lmf:       true         # novel branch 2 — geometry / space
+  spatial_backbone: efficientnet_b0
+  init_from_fswnet: image_stage/notebooks/best_fsw_net.pth
+
+train:
+  epochs:      12
+  batch_size:  2              # RTX 4060 8 GB
+  grad_accum:  8              # -> effective batch 16
+  lr:          3.0e-4
+  backbone_lr: 3.0e-5
+  amp:         true
+  focal_gamma: 2.0
+  monitor:     val_auc
+
+vlm:
+  # 7B cannot be fine-tuned on 8 GB. Skyra is inference-only; the tuned
+  # condition uses 3B, and the comparison table must say so.
+  base_model_id: Qwen/Qwen2.5-VL-3B-Instruct
+  skyra_model_id: ""          # set from the HF collection; empty => NOT RUN
+  num_frames:   4
+  load_in_4bit: true
+  freeze_vision_tower: true   # unfreezing this is how you OOM on 8 GB
+  lora_r: 16
+
+ablation:
+  conditions:
+    B0: {use_tsc: false, use_lmf: false}   # conventional FSV-Net
+    C1: {use_tsc: true,  use_lmf: false}
+    C2: {use_tsc: false, use_lmf: true}
+    C3: {use_tsc: true,  use_lmf: true}    # PROPOSED

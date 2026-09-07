@@ -1,0 +1,16 @@
+{
+  "n_train": 14757,
+  "n_test": 3165,
+  "hash": "dHash-64",
+  "contamination_at_hamming_0": 0.0227,
+  "contamination_at_hamming_2": 0.0259,
+  "contamination_at_hamming_5": 0.0692,
+  "contamination_at_hamming_10": 0.484,
+  "by_class_at_hamming_5": {
+    "ai_generated": 0.0417,
+    "deepfake": 0.0652,
+    "edited": 0.0,
+    "real": 0.0755
+  },
+  "median_min_distance": 11.0
+}
