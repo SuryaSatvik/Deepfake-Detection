@@ -40,6 +40,17 @@ Module map
     evidence        *** the forensic evidence pack ***
     vlm_reasoner    Qwen2.5-VL / Claude / template reasoning with fallbacks
     inference       single-video end-to-end pipeline
+
+CFX -- the explanation layer (see docs/CFX.md)
+----------------------------------------------
+    calibrate       temperature/Platt scaling, adaptive ECE, Brier decomposition
+    uncertainty     window spread, TTA, MC dropout
+    selective       conformal abstention, risk-coverage, the coverage assertion
+    attribution     exact branch Shapley, IG, KernelSHAP, counterfactuals
+    faithfulness    deletion/insertion/comprehensiveness + the random control
+    arbitrate       *** which evidence is solid in which model ***
+    narrate         the technical/layman registers and their guard-rails
+    cfx             *** CFXPipeline -> ExplanationCard ***
 """
 
 __version__ = "1.0.0"
@@ -68,6 +79,18 @@ def __getattr__(name: str):
         "make_splits": ("fsvnet.manifest", "make_splits"),
         "VideoInferencePipeline": ("fsvnet.inference", "VideoInferencePipeline"),
         "EvidenceReasoner": ("fsvnet.vlm_reasoner", "EvidenceReasoner"),
+        # ---- CFX (docs/CFX.md) ----
+        "CFXPipeline": ("fsvnet.cfx", "CFXPipeline"),
+        "CFXConfig": ("fsvnet.cfx", "CFXConfig"),
+        "ExplanationCard": ("fsvnet.cfx", "ExplanationCard"),
+        "TemperatureScaler": ("fsvnet.calibrate", "TemperatureScaler"),
+        "calibration_report": ("fsvnet.calibrate", "calibration_report"),
+        "fit_abstention": ("fsvnet.selective", "fit_abstention"),
+        "AbstentionPolicy": ("fsvnet.selective", "AbstentionPolicy"),
+        "ReliabilityMatrix": ("fsvnet.arbitrate", "ReliabilityMatrix"),
+        "ConfidenceStack": ("fsvnet.arbitrate", "ConfidenceStack"),
+        "branch_shapley_exact": ("fsvnet.attribution", "branch_shapley_exact"),
+        "Lexicon": ("fsvnet.narrate", "Lexicon"),
     }
     if name in lazy:
         import importlib

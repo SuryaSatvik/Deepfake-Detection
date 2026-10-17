@@ -1,0 +1,174 @@
+# lexicon.yaml
+# =============
+# The controlled vocabulary for the layman register.
+#
+# This file exists so the plain-language mapping is auditable and editable
+# instead of buried inside a prompt string. If a phrase here is wrong or
+# misleading, it can be fixed without touching any code, and a reviewer can
+# check every translation the system is allowed to make.
+#
+# Rules the file enforces:
+#   * terms      -- a technical term may only be rendered as the phrase given
+#                   here. Nothing else gets a plain-language name, which means
+#                   the model cannot invent a folksy description of a
+#                   measurement it does not have.
+#   * confidence -- a calibrated probability always produces the same words.
+#                   The same number can never be "very likely" in one clip and
+#                   "almost certain" in the next.
+#   * forbidden  -- words that overstate certainty. The layman list is stricter
+#                   than the technical list, because a non-technical reader
+#                   cannot discount hedging the way a specialist does.
+
+version: 1
+
+terms:
+  temporal_whiteness:
+    layman: "the fine grain of the face changes from frame to frame in a way that real camera footage usually does not"
+    technical: "temporal whiteness of the fine-detail power spectrum"
+  temporal_peakiness:
+    layman: "the picture has a faint repeating pulse to it, as if frames were blended on a cycle"
+    technical: "temporal spectrum peakiness (single-bin concentration)"
+  flicker_index:
+    layman: "the amount of fine flicker is unusual -- either too much or suspiciously little"
+    technical: "signed flicker index against the real-video reference"
+  fine_ring_acf1:
+    layman: "the fine detail repeats itself between neighbouring frames instead of looking freshly captured each time"
+    technical: "lag-1 temporal autocorrelation of the fine-detail ring"
+  temporal_hf_ratio:
+    layman: "how much of the frame-to-frame change happens quickly rather than slowly"
+    technical: "share of temporal spectrum energy above Nyquist/3"
+  spectral_drift:
+    layman: "the overall sharpness of the picture shifts during the clip, which often just means the camera moved"
+    technical: "spatial spectrum drift across the clip (context only)"
+
+  # channels / branches
+  spatial:
+    layman: "what the face looks like"
+    technical: "spatial branch (EfficientNet-B0 semantic features)"
+  frequency:
+    layman: "the pattern of fine detail across the picture"
+    technical: "frequency branch (2D FFT, azimuthal rings)"
+  srm:
+    layman: "the camera's sensor fingerprint -- the faint noise every real camera leaves"
+    technical: "SRM noise-residual branch (fixed high-pass kernels)"
+  tsc:
+    layman: "how the fine detail changes over time"
+    technical: "temporal spectral coherence branch"
+  lmf:
+    layman: "how the facial features move relative to each other"
+    technical: "landmark-motion-compensated forensics branch"
+
+  # method names
+  grad_cam:
+    layman: "which parts of the face mattered"
+    technical: "Grad-CAM over the spatial branch"
+  temporal_occlusion:
+    layman: "which moments in the clip mattered"
+    technical: "per-frame freeze occlusion"
+  branch_shapley:
+    layman: "which kind of evidence the answer rested on"
+    technical: "exact Shapley values over the branches"
+  integrated_gradients:
+    layman: "which parts of the face mattered"
+    technical: "integrated gradients against a blurred baseline"
+  kernel_shap:
+    layman: "which regions of the face mattered"
+    technical: "KernelSHAP over SLIC superpixels"
+  counterfactual_spectral:
+    layman: "how fine the detail has to be before the answer changes"
+    technical: "minimal low-pass cutoff that flips the verdict"
+  counterfactual_temporal:
+    layman: "how many moments have to be removed before the answer changes"
+    technical: "minimal set of frozen frames that flips the verdict"
+  counterfactual_region:
+    layman: "how much of the picture has to be blurred before the answer changes"
+    technical: "minimal blurred region set that flips the verdict"
+
+# A calibrated probability always maps to the same words, and always keeps the
+# number beside it. Natural frequencies ("about 7 times in 10") are included
+# because people read them far more accurately than percentages.
+confidence:
+  - max: 0.25
+    verdict: real
+    layman: "probably genuine"
+    technical: "low p(fake)"
+  - max: 0.60
+    verdict: uncertain
+    layman: "not clear either way"
+    technical: "borderline"
+  - max: 0.75
+    verdict: fake
+    layman: "leaning towards edited or generated"
+    technical: "weak evidence of manipulation"
+  - max: 0.90
+    verdict: fake
+    layman: "likely edited or generated"
+    technical: "moderate evidence of manipulation"
+  - max: 1.01
+    verdict: fake
+    layman: "very likely edited or generated"
+    technical: "strong evidence of manipulation"
+
+# Phrase used whenever the verdict falls inside the abstention band. Templated,
+# never generated: at this detector's honest accuracy it is the most frequently
+# shown sentence in the system, so it is written once and written carefully.
+abstain:
+  headline: "I can't tell whether this video is genuine."
+  body: >-
+    The signals I look at were either weak or disagreed with each other on this
+    clip, so a verdict here would be no better than a guess. That is a statement
+    about the limits of this detector, not evidence that the video is fine.
+  what_would_help:
+    - "a longer clip, or one that has been re-encoded fewer times"
+    - "a higher-resolution copy -- fine detail is where most of the evidence lives"
+    - "the original file rather than a screen recording or a re-upload"
+
+forbidden:
+  layman:
+    - clearly
+    - obviously
+    - definitely
+    - certainly
+    - proof
+    - proven
+    - confirmed
+    - undeniable
+    - without doubt
+    - guaranteed
+    - deepfake detected
+    - 100%
+    - fake for sure
+  technical:
+    - proof
+    - proven
+    - confirmed
+    - undeniable
+    - definitely
+
+# Claims a VLM reaches for when it has nothing measured to say. None of these are
+# measurable by FSV-Net, so any sentence containing one is dropped.
+ungrounded_terms:
+  - blink
+  - blinking
+  - eye movement
+  - lip sync
+  - lip-sync
+  - pulse rate
+  - heartbeat
+  - shadow
+  - reflection
+  - teeth
+  - earring
+  - hairline
+  - skin pore
+  - audio
+  - voice
+  - lighting
+  - cheek
+  - jawline
+  - mouth
+
+readability:
+  target_fk_grade: 8.0
+  max_fk_grade: 10.0
+  max_words: 130

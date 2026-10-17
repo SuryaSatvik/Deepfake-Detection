@@ -60,3 +60,10 @@ preview/
 .env.*
 *.key
 secrets.json
+
+# --- local-only: book/chapter material, archives, separate repos ---
+/*.zip
+/*.pdf
+/chapter_latex_*/
+/Claude outputs/
+/mainUI1_xai/

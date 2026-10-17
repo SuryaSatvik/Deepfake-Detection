@@ -164,13 +164,21 @@ claims, including that no reported number was hand-typed.
 │   ├── faces.py                     face detection for arbitrary uploads
 │   ├── evidence.py  explain.py      evidence pack, Grad-CAM, occlusion
 │   ├── qwen_detector.py             Qwen2.5-VL as detector, QLoRA
-│   └── train.py  evaluate.py        training, video-level metrics, ablations
+│   ├── train.py  evaluate.py        training, video-level metrics, ablations
+│   └── cfx.py + calibrate, uncertainty, selective, attribution,
+│       faithfulness, arbitrate, narrate, xai_eval
+│                                    CFX explanation layer (docs/CFX.md)
 ├── streamlit/app.py                 the frontend
+├── streamlit/cfx_app.py             the CFX frontend (verdict, confidence, one explanation)
+├── assets/lexicon.yaml              technical/layman vocabulary for narration
 ├── notebooks/model analysis.ipynb   the analysis, 24 sections
+├── notebooks/CFX_RUN_ALL.ipynb      fit + evaluate the CFX layer end to end
+├── notebooks/XAI_Eval_RESULTS.ipynb XAI evaluation results
 ├── scripts/                         manifest, extractors, training, evaluation
 ├── results/                         metrics, predictions, ablations, figures
 ├── image_stage/                     the earlier image-level project, preserved
-└── docs/FINDINGS.md                 the measured results — read this first
+├── docs/FINDINGS.md                 the measured results — read this first
+└── docs/CFX.md                      the explanation layer, implementation reference
 ```
 
 ---
